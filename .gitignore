@@ -1,0 +1,15 @@
+# Entornos y artefactos de construccion
+.venv/
+env/
+__pycache__/
+*.pyc
+build/
+dist/
+build_log.txt
+.idea/
+
+# Datos de participantes: no se versionan (quedan solo en cada equipo)
+data/
+respaldo_*/
+/*.csv
+.metawear/

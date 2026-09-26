@@ -1,0 +1,6 @@
+# Dependencias de la aplicacion (versiones probadas con Python 3.13, Windows 10/11)
+metawear==1.0.8
+warble==1.2.9
+numpy==2.5.3
+PyQt6==6.11.0
+pyqtgraph==0.14.0

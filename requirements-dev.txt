@@ -1,0 +1,5 @@
+-r requirements.txt
+# Construccion del ejecutable (el instalador usa ademas Inno Setup 6)
+pyinstaller==6.22.3
+# Solo para los scripts antiguos adquisicion.py / adquisicion_IMU.py
+pandas

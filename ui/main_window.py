@@ -1,15 +1,16 @@
 """Ventana principal para experiencias de evento y evaluación funcional."""
 import os
+import sys
 import time
 from collections import deque
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import QRegularExpression, Qt, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
-    QSpinBox,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTextBrowser, QVBoxLayout,
+    QWidget, QSpinBox,
 )
 
 from core import config
@@ -19,7 +20,7 @@ from core.clinical_references import sts_comparison, timed_comparison
 from core.kinematics import ALGORITHM_VERSION, Check, Metric, RepDetector, RepResult
 from core.orientation import tilt_angle_diff_deg
 from core.pipeline import SignalProcessor
-from core.report import ReportContext, interpretation_for, render_html, verdict
+from core.report import ReportContext, interpretation_for, participant_summary, render_html, verdict
 from core.sample_clock import reconstruct
 from core.sensor_stream import ACC_RANGE_G, SensorStream, SimulatedSensorStream
 from core.timed_capture import TimedCapture, TimedResult
@@ -32,6 +33,12 @@ SAMPLE_RATE_HZ = 100.0
 NO_REP_TIMEOUT_MS = 20_000
 PLOT_REFRESH_MS = 33
 LINK_WINDOW_S = 2.0
+MIN_MASS_KG = 15.0
+# El ejecutable instalado no incluye Simular_MMS.cmd: tiene un acceso en el menú Inicio.
+SIMULATION_HINT = (
+    "abre «Adquisición MMS (simulación, sin sensor)» desde el menú Inicio"
+    if getattr(sys, "frozen", False) else "usa Simular_MMS.cmd"
+)
 
 
 class MainWindow(QMainWindow):
@@ -55,7 +62,12 @@ class MainWindow(QMainWindow):
         self.current_sub = storage.next_participant_number()
 
         self.processor = SignalProcessor(SAMPLE_RATE_HZ, ACC_RANGE_G)
-        self.reference_q = storage.load_reference_orientation()
+        # Hilos de sensor que se pidieron detener pero siguen ocupando el Bluetooth
+        # (connect() no se puede interrumpir). Se conservan hasta que terminen: si Qt
+        # destruyera un QThread en ejecucion, cerraria la aplicacion de golpe.
+        self._retired_sensors: list = []
+        self._start_pending = False
+        self._references: dict = {}  # ubicacion del sensor -> cuaternion de referencia
         self.live_orientation = {"roll": 0.0, "pitch": 0.0, "angle_diff": None}
         # (hora de llegada, muestras perdidas antes) para el indicador de enlace en vivo
         self._link: deque = deque()
@@ -81,6 +93,15 @@ class MainWindow(QMainWindow):
 
     # -- Sensor lifecycle -----------------------------------------------
     def _start_sensor(self):
+        self.event_page.set_sensor_status("conectando")
+        self.home_page.set_sensor_status("conectando")
+        busy = next((s for s in self._retired_sensors if s.isRunning()), None)
+        if busy is not None:
+            # El hilo anterior aun tiene el sensor: conectar cuando lo libere.
+            if not self._start_pending:
+                self._start_pending = True
+                busy.finished.connect(self._start_when_free)
+            return
         cls = SimulatedSensorStream if self.simulate else SensorStream
         self.processor = SignalProcessor(SAMPLE_RATE_HZ, ACC_RANGE_G)
         self._link.clear()
@@ -91,11 +112,17 @@ class MainWindow(QMainWindow):
         self.sensor.sample_ready.connect(self._on_sample)
         self.sensor.start()
 
+    def _start_when_free(self):
+        self._retired_sensors = [s for s in self._retired_sensors if s.isRunning()]
+        if self._start_pending:
+            self._start_pending = False
+            self._start_sensor()
+
     def _on_sensor_error(self, message: str):
         if "Failed to discover gatt services" in message:
             message = (
                 "No se pudieron leer los servicios Bluetooth del sensor (GATT). "
-                "Comprueba que esté encendido y que ninguna otra aplicación lo esté usando"
+                "Compruebe que esté encendido y que ninguna otra aplicación lo esté usando"
             )
         self.home_page.set_sensor_status("error")
         self.home_page.set_error_message(message)
@@ -104,12 +131,26 @@ class MainWindow(QMainWindow):
         if self.stack.currentWidget() is self.capture_page:
             self.capture_page.abort(f"Se perdió la conexión con el sensor durante la prueba: {message}.")
 
-    def stop_sensor(self):
-        if self.sensor is not None and self.sensor.isRunning():
-            # Sus avisos de "desconectado" ya no corresponden al sensor que se usará.
-            self.sensor.blockSignals(True)
-            self.sensor.request_stop()
-            self.sensor.wait(5000)
+    def sensor_running(self) -> bool:
+        return self.sensor is not None and self.sensor.isRunning()
+
+    def stop_sensor(self, wait_ms: int = 5000):
+        sensor, self.sensor = self.sensor, None
+        if sensor is None or not sensor.isRunning():
+            return
+        # Sus avisos ya no corresponden al sensor que se usará. (No se usa blockSignals:
+        # bloquearía también "finished", que se necesita para saber cuándo terminó.)
+        for signal in (sensor.status_changed, sensor.error, sensor.sample_ready):
+            try:
+                signal.disconnect()
+            except TypeError:
+                pass
+        sensor.request_stop()
+        if not sensor.wait(wait_ms):
+            self._retired_sensors.append(sensor)
+
+    def sensor_threads_alive(self) -> bool:
+        return self.sensor_running() or any(s.isRunning() for s in self._retired_sensors)
 
     def configure_sensor(self):
         """Elegir otro sensor (buscar por Bluetooth o escribir la MAC)."""
@@ -119,18 +160,17 @@ class MainWindow(QMainWindow):
         accepted = dialog.exec()
         if accepted and dialog.selected_mac:
             self.config["mac_address"] = dialog.selected_mac
-            config.save(self.config)
-        if accepted or not self.sensor.isRunning():
+            try:
+                config.save(self.config)
+            except OSError as exc:
+                QMessageBox.warning(self, "Configuración", f"No se pudo guardar la configuración: {exc}")
+        if accepted or not self.sensor_running():
             self.stop_sensor()
-            self.event_page.set_sensor_status("conectando")
-            self.home_page.set_sensor_status("conectando")
             self._start_sensor()
 
     def retry_sensor(self):
-        if self.sensor.isRunning():
+        if self.sensor_running() or self._start_pending:
             return
-        self.event_page.set_sensor_status("conectando")
-        self.home_page.set_sensor_status("conectando")
         self._start_sensor()
 
     def link_received_pct(self) -> float | None:
@@ -149,8 +189,9 @@ class MainWindow(QMainWindow):
             self._link.popleft()
 
         angle_diff = None
-        if self.reference_q is not None:
-            angle_diff = tilt_angle_diff_deg(self.reference_q, self.processor.ahrs.q)
+        reference = self._reference_q()
+        if reference is not None:
+            angle_diff = tilt_angle_diff_deg(reference, self.processor.ahrs.q)
         self.live_orientation = {"roll": s.roll, "pitch": s.pitch, "angle_diff": angle_diff}
 
         row = {
@@ -167,9 +208,38 @@ class MainWindow(QMainWindow):
         elif current is self.capture_page:
             self.capture_page.feed_sample(row, s)
 
-    def calibrate_reference(self):
-        self.reference_q = self.processor.ahrs.q.copy()
-        storage.save_reference_orientation(list(self.reference_q))
+    def _sensor_position(self) -> str | None:
+        return MODES[self.current_mode]["sensor_pos"] if self.current_mode else None
+
+    def _reference_q(self):
+        """Referencia de la ubicacion de la prueba actual (cadera, muneca...)."""
+        position = self._sensor_position()
+        if position is None:
+            return None
+        if position not in self._references:
+            self._references[position] = storage.load_reference_orientation(position)
+        return self._references[position]
+
+    def calibrate_reference(self) -> bool:
+        position = self._sensor_position()
+        if position is None:
+            return False
+        answer = QMessageBox.question(
+            self, "Calibrar referencia",
+            f"¿Guardar la inclinación actual como referencia para el sensor en «{position.lower()}»?\n\n"
+            "Hágalo con el sensor bien colocado en la postura inicial de la prueba. "
+            "Reemplaza la referencia anterior de esa ubicación.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        q = self.processor.ahrs.q.copy()
+        try:
+            storage.save_reference_orientation(position, list(q))
+        except OSError as exc:
+            QMessageBox.warning(self, "Calibrar referencia", f"No se pudo guardar la referencia: {exc}")
+            return False
+        self._references[position] = list(q)
+        return True
 
     def closeEvent(self, event):
         self.stop_sensor()
@@ -178,10 +248,15 @@ class MainWindow(QMainWindow):
     # -- Navegacion -------------------------------------------------------
     def goto_event(self, new_participant: bool = True):
         if new_participant:
-            self.current_sub = storage.next_participant_number()
-            self.current_age_years = None
-            self.setup_page.age_input.setValue(0)
+            self._new_participant()
         self.stack.setCurrentWidget(self.event_page)
+
+    def _new_participant(self):
+        """Borra los datos de la persona anterior: su peso no debe usarse con la siguiente."""
+        self.current_sub = storage.next_participant_number()
+        self.current_age_years = None
+        self.current_mass_kg = None
+        self.setup_page.reset_participant()
 
     def start_event(self):
         self.current_mode = "event"
@@ -189,9 +264,7 @@ class MainWindow(QMainWindow):
 
     def goto_home(self, new_participant: bool = True):
         if new_participant:
-            self.current_sub = storage.next_participant_number()
-            self.current_age_years = None
-            self.setup_page.age_input.setValue(0)
+            self._new_participant()
         self.home_page.refresh()
         self.stack.setCurrentWidget(self.home_page)
 
@@ -212,7 +285,8 @@ class MainWindow(QMainWindow):
             RepDetector(self.current_mode, mass_kg or 70.0, SAMPLE_RATE_HZ)
             if meta["capture_type"] == "power" else None
         )
-        self.sensor.set_profile(self.current_mode)
+        if self.sensor is not None:
+            self.sensor.set_profile(self.current_mode)
         self.raw_buffer = []
         self.capture_page.load_mode(self.current_mode)
         self.stack.setCurrentWidget(self.capture_page)
@@ -222,15 +296,32 @@ class MainWindow(QMainWindow):
         meta = MODES[mode]
         task = meta["task_code"]
         is_timed = isinstance(result, TimedResult)
+        # Un fallo al guardar (disco lleno, archivo bloqueado...) no debe impedir mostrar el
+        # resultado: se avisa en el reporte y en pantalla.
+        save_warnings: list[str] = []
         run = storage.next_run_number(self.current_sub, task)
         self._finalize_times()
-        raw_path = storage.save_raw_session(self.current_sub, task, run, self.raw_buffer) if self.raw_buffer else ""
+        raw_path = ""
+        if self.raw_buffer:
+            try:
+                raw_path = storage.save_raw_session(self.current_sub, task, run, self.raw_buffer)
+            except storage.SaveError as exc:
+                save_warnings.append(str(exc))
         quality = signal_quality.assess(self.raw_buffer, SAMPLE_RATE_HZ)
+
+        def save_row(append, *args):
+            try:
+                warning = append(*args)
+            except storage.SaveError as exc:
+                warning = str(exc)
+            if warning:
+                save_warnings.append(warning)
 
         checks: list[Check] = []
         if abort_reason:
             checks.append(Check("Conexión con el sensor", "fail", abort_reason))
-        checks.append(signal_quality.transmission_check(quality, strict=False))
+        # Estricto en las pruebas que se calculan con la señal IMU (igual que el reprocesado).
+        checks.append(signal_quality.transmission_check(quality, strict=not is_timed))
         comparison_html = ""
         previous = None
 
@@ -255,8 +346,8 @@ class MainWindow(QMainWindow):
                                                 condition=self.current_condition)
                 if before is not None:
                     previous = ("Tiempo", before, result.duration_s, "s")
-                storage.append_timed_result(self.current_sub, task, run, result, self.current_condition,
-                                            self.current_age_years, quality)
+                save_row(storage.append_timed_result, self.current_sub, task, run, result,
+                         self.current_condition, self.current_age_years, quality)
                 if mode != "event":
                     comparison_html = _comparison_html(
                         timed_comparison(mode, result.duration_s, self.current_age_years))
@@ -264,6 +355,13 @@ class MainWindow(QMainWindow):
                       "La señal IMU se guarda como registro complementario.")
         else:
             rep: RepResult = result
+            if (mode == "jump" and rep.metric("potencia_pico_w") is not None
+                    and self.current_age_years is not None and self.current_age_years < 18):
+                checks.append(Check(
+                    "Ecuación de potencia", "warn",
+                    "La ecuación de Sayers se obtuvo en adultos jóvenes: en menores de 18 años la potencia "
+                    "estimada es poco fiable. La altura del salto sí es válida.",
+                ))
             # El CSV (columna "valido") y el reporte usan las mismas verificaciones.
             rep.checks = checks + rep.checks
             checks = rep.checks
@@ -275,8 +373,8 @@ class MainWindow(QMainWindow):
                 before = storage.previous_value(self.current_sub, task, timed=False, metric_key=primary.key)
                 if before is not None and rep.valid:
                     previous = (primary.label, before, primary.value, primary.unit)
-            storage.append_result(self.current_sub, task, run, rep, quality, self.current_mass_kg,
-                                  self.current_age_years, ALGORITHM_VERSION)
+            save_row(storage.append_result, self.current_sub, task, run, rep, quality,
+                     self.current_mass_kg, self.current_age_years, ALGORITHM_VERSION)
             if mode == "sts":
                 comparison_html = _comparison_html(sts_comparison())
 
@@ -289,8 +387,15 @@ class MainWindow(QMainWindow):
             previous=previous, mass_kg=self.current_mass_kg if meta.get("needs_mass") else None,
             age_years=self.current_age_years, condition=side,
             raw_file=os.path.basename(raw_path) if raw_path else "",
+            participant_text=participant_summary(
+                mode, verdict(checks, bool(metrics))[0], metrics, self.current_age_years),
+            save_warnings=save_warnings,
         )
-        report_path = storage.save_report(self.current_sub, task, run, render_html(ctx, standalone=True))
+        try:
+            report_path = storage.save_report(self.current_sub, task, run, render_html(ctx, standalone=True))
+        except storage.SaveError as exc:
+            report_path = ""
+            ctx.save_warnings.append(str(exc))
         self.result_page.show_report(mode, ctx, report_path)
         self.stack.setCurrentWidget(self.result_page)
 
@@ -410,8 +515,8 @@ class EventPage(QWidget):
             "conectando": "Conectando al sensor…",
             "conectado": "Sensor conectado. Preparando señal…",
             "transmitiendo": "Sensor listo para comenzar",
-            "desconectado": "Sensor desconectado. Comprueba Bluetooth o usa Simular_MMS.cmd.",
-            "error": "Error del sensor. Comprueba Bluetooth o usa Simular_MMS.cmd.",
+            "desconectado": f"Sensor desconectado. Comprueba el Bluetooth o {SIMULATION_HINT}.",
+            "error": f"Error del sensor. Comprueba el Bluetooth o {SIMULATION_HINT}.",
         }
         self.status_label.setText(messages.get(status, status))
         self.status_label.setStyleSheet(
@@ -423,7 +528,7 @@ class EventPage(QWidget):
             self.link_label.setText("")
 
     def set_error_message(self, message: str):
-        self.status_label.setText(f"Sensor: {message}. Puedes abrir Simular_MMS.cmd para probar la interfaz.")
+        self.status_label.setText(f"Sensor: {message}. Para probar la interfaz sin sensor, {SIMULATION_HINT}.")
 
     def feed_sample(self, s):
         self._t_buf.append(s.t)
@@ -597,8 +702,12 @@ class SetupPage(QWidget):
         self.mass_label = QLabel("Peso corporal (kg)")
         form_col.addWidget(self.mass_label)
         self.mass_input = QDoubleSpinBox()
-        self.mass_input.setRange(15.0, 200.0)
-        self.mass_input.setValue(70.0)
+        # 0 = sin indicar: el peso es obligatorio en salto y STS (la potencia depende de él)
+        # y se borra con cada participante nuevo.
+        self.mass_input.setRange(0.0, 200.0)
+        self.mass_input.setDecimals(1)
+        self.mass_input.setSpecialValueText("Indique el peso")
+        self.mass_input.setValue(0.0)
         self.mass_input.setFixedWidth(190)
         form_col.addWidget(self.mass_input)
 
@@ -606,6 +715,8 @@ class SetupPage(QWidget):
         form_col.addWidget(QLabel("N° de participante"))
         self.sub_input = QLineEdit()
         self.sub_input.setFixedWidth(190)
+        # Se usa en los nombres de archivo: solo letras y números.
+        self.sub_input.setValidator(QRegularExpressionValidator(QRegularExpression(r"[A-Za-z0-9]{0,12}")))
         form_col.addWidget(self.sub_input)
 
         form_col.addSpacing(16)
@@ -638,6 +749,10 @@ class SetupPage(QWidget):
         orientation_col.addWidget(calibrate_btn)
         content_row.addLayout(orientation_col)
 
+        self.form_error = QLabel()
+        self.form_error.setStyleSheet(f"color: {BAD}; font-weight: 600;")
+        self.form_error.setWordWrap(True)
+
         buttons_row = QHBoxLayout()
         back_btn = QPushButton("Volver")
         back_btn.clicked.connect(lambda: self.main_window.goto_home(False))
@@ -653,10 +768,16 @@ class SetupPage(QWidget):
         layout.addSpacing(24)
         layout.addLayout(content_row)
         layout.addStretch()
+        layout.addWidget(self.form_error)
         layout.addLayout(buttons_row)
+
+    def reset_participant(self):
+        self.age_input.setValue(0)
+        self.mass_input.setValue(0.0)
 
     def load_mode(self, mode_key: str):
         self.mode_key = mode_key
+        self.form_error.setText("")
         meta = MODES[mode_key]
         self.title_label.setText(meta["label"])
         self.instructions_label.setText(
@@ -670,6 +791,7 @@ class SetupPage(QWidget):
         self.condition_input.setVisible(mode_key == "single_leg")
         self.start_btn.setText("Comenzar" if is_power else "Iniciar registro")
         self.sub_input.setText(self.main_window.current_sub)
+        self.update_orientation(self.main_window.live_orientation)
 
     def update_orientation(self, state: dict):
         self.orientation_badge.set_values(state["angle_diff"], state["roll"], state["pitch"])
@@ -680,8 +802,18 @@ class SetupPage(QWidget):
     def _on_start(self):
         needs_mass = bool(MODES[self.mode_key].get("needs_mass"))
         mass = self.mass_input.value() if needs_mass else None
+        if needs_mass and mass < MIN_MASS_KG:
+            self.form_error.setText(f"Indique el peso corporal de esta persona (mínimo {MIN_MASS_KG:.0f} kg): "
+                                    "la potencia se calcula con él.")
+            self.mass_input.setFocus()
+            return
         entered_sub = self.sub_input.text().strip()
-        sub_id = entered_sub.zfill(2) if entered_sub else self.main_window.current_sub
+        sub_id = storage.normalize_sub(entered_sub) if entered_sub else self.main_window.current_sub
+        if sub_id is None:
+            self.form_error.setText("El N° de participante solo puede tener letras y números (máximo 12).")
+            self.sub_input.setFocus()
+            return
+        self.form_error.setText("")
         condition = self.condition_input.currentData() if self.mode_key == "single_leg" else ""
         age_years = self.age_input.value() or None
         self.main_window.start_capture(mass, sub_id, condition, age_years)
@@ -839,6 +971,13 @@ class CapturePage(QWidget):
         if live.phase != self._phase:
             self._phase = live.phase
             self._set_state(*PHASE_TEXT[live.phase])
+            if live.phase == "armed":
+                # El plazo para moverse cuenta desde «¡Ahora!», no desde que se abrió la pantalla.
+                self._timeout_timer.start(NO_REP_TIMEOUT_MS)
+            elif live.phase == "moving":
+                # Un movimiento en curso no se corta: el detector lo cierra por reposo final
+                # o, a los MAX_REP_S segundos, lo marca para repetir.
+                self._timeout_timer.stop()
 
         if rep_result is not None:
             self._stop()
@@ -923,6 +1062,16 @@ class ResultPage(QWidget):
         self.title_label.setObjectName("title")
         self.verdict_label = QLabel()
         self.verdict_label.setWordWrap(True)
+        # Explicación breve para la persona evaluada (lenguaje llano, sin diagnóstico).
+        self.participant_label = QLabel()
+        self.participant_label.setWordWrap(True)
+        self.participant_label.setStyleSheet(
+            f"background: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 10px; "
+            f"padding: 10px 14px; font-size: 16px;"
+        )
+        self.save_label = QLabel()
+        self.save_label.setWordWrap(True)
+        self.save_label.setStyleSheet(f"color: {WARN}; font-weight: 600;")
 
         cards_row = QHBoxLayout()
         cards_row.setSpacing(16)
@@ -957,10 +1106,12 @@ class ResultPage(QWidget):
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.verdict_label)
+        layout.addWidget(self.participant_label)
         layout.addLayout(cards_row)
         layout.addSpacing(6)
         layout.addWidget(report_title)
         layout.addWidget(self.report_view, stretch=1)
+        layout.addWidget(self.save_label)
         layout.addLayout(buttons_row)
 
     def show_report(self, mode_key: str, ctx: ReportContext, report_path: str):
@@ -974,6 +1125,11 @@ class ResultPage(QWidget):
         color = {"ok": GOOD, "warn": WARN, "fail": BAD}[state]
         self.verdict_label.setText(title if state != "fail" else f"{title}: {action}")
         self.verdict_label.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: 700;")
+        self.participant_label.setText(ctx.participant_text)
+        self.participant_label.setVisible(bool(ctx.participant_text))
+        self.save_label.setText("\n".join(ctx.save_warnings))
+        self.save_label.setVisible(bool(ctx.save_warnings))
+        self.open_btn.setEnabled(bool(report_path))
 
         shown = [] if state == "fail" else sorted(ctx.metrics, key=lambda m: not m.primary)[:4]
         for card, metric in zip(self.cards, shown):

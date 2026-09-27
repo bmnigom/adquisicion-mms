@@ -23,6 +23,9 @@ from core.sample_clock import reconstruct
 
 RATE_HZ = 100.0
 OLD_ACC_RANGE_G = 4.0     # rango configurado en la version anterior
+# El CSV anterior no guardaba el peso: la potencia reprocesada usa este valor para todos
+# y NO es comparable entre personas (la altura del salto y el ascenso no dependen de el).
+DEFAULT_MASS_KG = 70.0
 OLD_RESULTS = os.path.join(storage.DATA_DIR, "resultados_ciclovia.csv")
 OUT_CSV = os.path.join(storage.DATA_DIR, "reprocesado_datos_anteriores.csv")
 OUT_HTML = os.path.join(storage.REPORTS_DIR, "reprocesado_datos_anteriores.html")
@@ -37,17 +40,17 @@ def parse_name(path):
 def load_old_results():
     old = {}
     if os.path.exists(OLD_RESULTS):
-        with open(OLD_RESULTS, newline="", encoding="utf-8") as f:
+        with open(OLD_RESULTS, newline="", encoding=storage.CSV_READ_ENCODING) as f:
             for row in csv.DictReader(f):
                 old[(row["fecha"], row["sub"], row["task"], row["run"])] = row
     return old
 
 
 def analyze_file(path, task):
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding=storage.CSV_READ_ENCODING) as f:
         rows = list(csv.DictReader(f))
-    if "host_time" in rows[0]:
-        return None  # ya grabado con la version nueva
+    if not rows or "host_time" in rows[0]:
+        return None  # vacio, o ya grabado con la version nueva
     host = [float(r["time"]) for r in rows]
     times, lost = reconstruct(host, RATE_HZ)
     proc = SignalProcessor(RATE_HZ, OLD_ACC_RANGE_G)
@@ -65,7 +68,7 @@ def analyze_file(path, task):
     if task not in POWER_TASKS:
         return {"quality": quality, "checks": checks, "rep": None}
 
-    detector = RepDetector(task, 70.0, RATE_HZ)
+    detector = RepDetector(task, DEFAULT_MASS_KG, RATE_HZ)
     rep = None
     for s in samples:
         _, rep = detector.update(s)
@@ -81,6 +84,17 @@ def analyze_file(path, task):
             rep = detector.timeout_result(quality.duration_s)
     rep.checks = checks + rep.checks
     return {"quality": quality, "checks": rep.checks, "rep": rep}
+
+
+def _old_text(old: dict | None) -> str:
+    """Resultado anterior legible; tolera celdas vacias o no numericas."""
+    if not old:
+        return "—"
+    try:
+        return (f'{float(old["peak_power_w"]):.0f} W · {float(old["peak_velocity_m_s"]):.2f} m/s · '
+                f'{float(old["max_displacement_m"]) * 100:.0f} cm')
+    except (KeyError, ValueError):
+        return "—"
 
 
 def main():
@@ -101,7 +115,7 @@ def main():
             "checks": analysis["checks"],
         })
 
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    with open(OUT_CSV, "w", newline="", encoding=storage.CSV_WRITE_ENCODING) as f:
         writer = csv.writer(f)
         writer.writerow([
             "archivo", "sub", "fecha", "task", "run", "veredicto_v2", "motivo",
@@ -124,8 +138,7 @@ def main():
     rows_html = []
     for r in results:
         q, rep, o = r["quality"], r["rep"], r["old"]
-        old_txt = (f'{float(o["peak_power_w"]):.0f} W · {float(o["peak_velocity_m_s"]):.2f} m/s · '
-                   f'{float(o["max_displacement_m"]) * 100:.0f} cm') if o else "—"
+        old_txt = _old_text(o)
         primary = rep.primary if rep is not None and rep.valid else None
         new_txt = f"{primary.label}: {primary.text()} {primary.unit}" if primary else "—"
         rows_html.append(
@@ -145,7 +158,9 @@ def main():
         f"<p>Generado el {dt.datetime.now():%Y-%m-%d %H:%M} con el algoritmo v{ALGORITHM_VERSION}. "
         "Los archivos originales no se modificaron. «Recibidas» es el porcentaje de muestras que llegaron "
         "por Bluetooth (reconstruido a partir de las horas de llegada). La columna «Resultado anterior» "
-        "muestra lo que se guardó en resultados_ciclovia.csv con el algoritmo 1.x.</p>"
+        "muestra lo que se guardó en resultados_ciclovia.csv con el algoritmo 1.x. La potencia v2 se "
+        f"calculó con {DEFAULT_MASS_KG:.0f} kg para todos (el registro anterior no guardaba el peso): "
+        "no la compare entre personas.</p>"
         "<table><tr><th>Archivo</th><th>Prueba</th><th>Recibidas</th><th>Resultado anterior</th>"
         "<th>Veredicto v2</th><th>Resultado v2</th><th>Motivo</th></tr>"
         + "".join(rows_html) + "</table></body></html>"

@@ -3,13 +3,19 @@
 Ejecutar desde la carpeta del proyecto:
     python -m tests.test_algoritmos
 """
+import json
 import math
+import os
 import random
 import sys
+import tempfile
 
 import numpy as np
 
-from core.kinematics import RepDetector
+from core import config, storage
+from core.imu_pairing import ImuPairer
+from core.kinematics import Metric, RepDetector
+from core.report import participant_summary
 from core.orientation import MahonyAHRS, tilt_angle_diff_deg
 from core.pipeline import SignalProcessor
 from core.sample_clock import SampleClock
@@ -80,7 +86,8 @@ def main():
         raw = sim.to_sensor_samples(sim.jump_profile(h), seed=2)
         rep, _ = run_detector("jump", raw)
         got = rep.metric("altura_salto_cm").value if rep and rep.valid else float("nan")
-        ok &= check(f"Salto {h * 100:.0f} cm", abs(got - h * 100) < 2.0, f"medido={got:.1f} cm")
+        # Tolerancia 1 cm: la simulacion redondea el vuelo a muestras enteras (hasta ±0,6 cm).
+        ok &= check(f"Salto {h * 100:.0f} cm", abs(got - h * 100) < 1.0, f"medido={got:.1f} cm")
 
     raw = sim.to_sensor_samples(sim.jump_profile(0.30), seed=3)
     flight_idx = 100 + 25 + 35 + 10  # reposo 1 s + contramovimiento + impulso + 0,1 s de vuelo
@@ -91,7 +98,7 @@ def main():
                     "; ".join(c.detail for c in rep.checks if c.status == "fail") if rep else "sin resultado")
     rep, _ = run_detector("jump", raw, stall=(flight_idx / RATE, 0.3))
     got = rep.metric("altura_salto_cm").value if rep and rep.valid else float("nan")
-    ok &= check("Salto con PC bloqueado 300 ms (sin pérdida) se acepta", abs(got - 30) < 2.0,
+    ok &= check("Salto con PC bloqueado 300 ms (sin pérdida) se acepta", abs(got - 30) < 1.0,
                 f"medido={got:.1f} cm")
 
     for rise in (0.30, 0.45):
@@ -120,9 +127,121 @@ def main():
     # Sin reposo previo no se arma el detector
     det = RepDetector("jump", 70, RATE)
     ok &= check("Sin reposo previo no mide", det.timeout_result(15).valid is False)
+    det.phase = "moving"
+    ok &= check("Límite con movimiento en curso lo explica",
+                "no quedó quieta" in det.timeout_result(20).checks[0].detail)
+
+    ok &= test_pairing()
+    ok &= test_storage_and_config()
+    ok &= test_participant_text()
 
     print("\nTODAS LAS PRUEBAS PASARON" if ok else "\nHAY PRUEBAS FALLIDAS")
     return 0 if ok else 1
+
+
+def test_pairing():
+    ok = True
+    # Paquetes de 3 muestras, giroscopio iniciado antes y llegando a veces antes, a veces despues.
+    p = ImuPairer()
+    out = p.add_gyro(("pre",) * 3)  # anterior a la primera aceleracion: se descarta
+    for k in range(0, 30, 3):
+        if k % 6 == 0:
+            for i in range(k, k + 3):
+                out += p.add_acc((i,) * 3, i)
+            for i in range(k, k + 3):
+                out += p.add_gyro((i,) * 3)
+        else:
+            for i in range(k, k + 3):
+                out += p.add_gyro((i,) * 3)
+            for i in range(k, k + 3):
+                out += p.add_acc((i,) * 3, i)
+    ok &= check("Giroscopio emparejado con su muestra",
+                len(out) == 30 and all(acc[0] == gyro[0] and paired for acc, gyro, _, paired in out))
+    # Giroscopio detenido: la aceleracion no queda retenida mas de MAX_WAIT muestras.
+    p = ImuPairer()
+    out = []
+    for i in range(20):
+        out += p.add_acc((i,) * 3, i)
+    ok &= check("Sin giroscopio no se retiene la señal", len(out) == 20 - p.max_wait and p.fallbacks == len(out))
+    return ok
+
+
+def _use_temp_data_dir(tmp):
+    storage.DATA_DIR = tmp
+    storage.RESULTS_LOG = os.path.join(tmp, "resultados_ciclovia_v2.csv")
+    storage.TIMED_RESULTS_LOG = os.path.join(tmp, "resultados_pruebas_funcionales.csv")
+    storage.REFERENCE_ORIENTATION_FILE = os.path.join(tmp, "orientacion_referencia.json")
+    storage.REPORTS_DIR = os.path.join(tmp, "reportes")
+
+
+def test_storage_and_config():
+    from core.timed_capture import TimedResult
+    ok = True
+    saved = {k: getattr(storage, k) for k in
+             ("DATA_DIR", "RESULTS_LOG", "TIMED_RESULTS_LOG", "REFERENCE_ORIENTATION_FILE", "REPORTS_DIR")}
+    with tempfile.TemporaryDirectory() as tmp:
+        _use_temp_data_dir(tmp)
+        try:
+            ok &= check("ID de participante válido", storage.normalize_sub("7") == "07"
+                        and storage.normalize_sub("AB12") == "AB12")
+            ok &= check("ID con caracteres de ruta se rechaza",
+                        all(storage.normalize_sub(t) is None for t in ("3/4", "a_b", "..", "c:", "")))
+
+            # CSV bloqueado (Excel): la fila va al pendiente y se incorpora despues.
+            real_write = storage._write_rows
+
+            def locked(path, header, rows):
+                if path == storage.TIMED_RESULTS_LOG:
+                    raise PermissionError(13, "Permission denied")
+                real_write(path, header, rows)
+
+            storage._write_rows = locked
+            warning = storage.append_timed_result("01", "tug", "01", TimedResult(10.5, 900, "manual"))
+            storage._write_rows = real_write
+            pending = storage._pending_path(storage.TIMED_RESULTS_LOG)
+            ok &= check("CSV bloqueado: aviso y fila en pendiente", "Excel" in warning and os.path.exists(pending))
+            ok &= check("Valor anterior se lee del pendiente",
+                        storage.previous_value("01", "tug", timed=True) == 10.5)
+            warning = storage.append_timed_result("01", "tug", "02", TimedResult(9.8, 900, "manual"))
+            with open(storage.TIMED_RESULTS_LOG, encoding="utf-8-sig") as f:
+                lines = f.read().splitlines()
+            ok &= check("Pendiente incorporado al desbloquear",
+                        warning == "" and len(lines) == 3 and not os.path.exists(pending), f"lineas={len(lines)}")
+            with open(storage.TIMED_RESULTS_LOG, "rb") as f:
+                ok &= check("CSV legible en Excel (BOM UTF-8)", f.read(3) == b"\xef\xbb\xbf")
+
+            # Un intento sin muestras deja reporte: el siguiente no lo sobrescribe.
+            storage.save_report("01", "jump", "01", "<p>sin datos</p>")
+            ok &= check("Número de intento no se reutiliza", storage.next_run_number("01", "jump") == "02")
+
+            # Archivos danados no impiden arrancar.
+            with open(storage.REFERENCE_ORIENTATION_FILE, "w") as f:
+                f.write("{no es json")
+            ok &= check("Referencia dañada se ignora", storage.load_reference_orientation("Muñeca") is None)
+            storage.save_reference_orientation("Muñeca", [1, 0, 0, 0])
+            ok &= check("Referencia por ubicación", storage.load_reference_orientation("Muñeca") == [1, 0, 0, 0]
+                        and storage.load_reference_orientation("Cintura") is None)
+            with open(os.path.join(tmp, "configuracion.json"), "w") as f:
+                json.dump(["no", "es", "un", "dict"], f)
+            ok &= check("Configuración dañada usa valores por defecto",
+                        config.load()["mac_address"] == config.DEFAULT_MAC)
+        finally:
+            for k, v in saved.items():
+                setattr(storage, k, v)
+    return ok
+
+
+def test_participant_text():
+    ok = True
+    tug = [Metric("duration_s", "Tiempo", 13.2, "s")]
+    text = participant_summary("tug", "ok", tug, 70)
+    ok &= check("TUG ≥12 s en ≥65 años remite a profesional", "profesional de salud" in text and "No es un diagnóstico" in text)
+    ok &= check("TUG sin edad no aplica umbral", "12 s" not in participant_summary("tug", "ok", tug, None))
+    walk = [Metric("duration_s", "Tiempo", 5.0, "s"), Metric("velocidad_marcha", "Velocidad", 1.0, "m/s")]
+    ok &= check("Marcha 1,0 m/s en ≥65 años sin alarma", "profesional" not in participant_summary("walk", "ok", walk, 70))
+    ok &= check("Intento inválido no muestra valores",
+                "13" not in participant_summary("tug", "fail", tug, 70))
+    return ok
 
 
 if __name__ == "__main__":

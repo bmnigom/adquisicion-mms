@@ -4,7 +4,7 @@ La aplicación usa PyQt6 y puede iniciarse sin PyCharm en este equipo.
 
 ## Instalar en otro computador
 
-Use el instalador `AdquisicionMMS-2.0.0-instalador.exe` (sección *Releases* del repositorio en GitHub, o `dist\instalador` tras construirlo con `packaging\construir.cmd`). No requiere Python ni permisos de administrador. Requiere Windows 10/11 con Bluetooth. Si SmartScreen muestra «Windows protegió su PC», elija **Más información → Ejecutar de todas formas** (el instalador no está firmado).
+Use el instalador `AdquisicionMMS-2.1.0-instalador.exe` (sección *Releases* del repositorio en GitHub, o `dist\instalador` tras construirlo con `packaging\construir.cmd`). No requiere Python ni permisos de administrador. Requiere Windows 10/11 con Bluetooth. Si SmartScreen muestra «Windows protegió su PC», elija **Más información → Ejecutar de todas formas** (el instalador no está firmado).
 
 Tras instalar, abra **Adquisición MMS** desde el menú Inicio, encienda el sensor y use **Configurar sensor → Buscar sensores** para elegir el sensor de ese equipo (también puede escribir la dirección MAC). La elección se guarda en `%LOCALAPPDATA%\AdquisicionMMS\data\configuracion.json`. El menú Inicio incluye además el modo de simulación y un acceso a la carpeta de datos y reportes. Si ocurre un error inesperado, queda registrado en `registro_errores.log` dentro de esa carpeta.
 
@@ -86,7 +86,20 @@ La versión anterior calculaba potencia, velocidad y desplazamiento de forma no 
 
 Las pruebas de los algoritmos (señales sintéticas de valor conocido) se ejecutan con `python -m tests.test_algoritmos`.
 
-**Pendiente:** validar con el sensor real antes del próximo domingo. Grabe unos saltos junto a un método de referencia (plataforma de contacto o video a 240 fps) y compruebe que la línea de señal Bluetooth indica *buena*. Si el modelo es MetaMotionS, confirme además que el giroscopio se configura correctamente.
+## Cambios del algoritmo 2.1 (septiembre 2026)
+
+- **Para la persona evaluada:** la pantalla de resultado y el reporte incluyen una explicación breve en lenguaje llano. No diagnostica; solo remite a un profesional de salud cuando se alcanza un punto de referencia ya aplicado (TUG ≥ 12 s o marcha ≤ 0,8 m/s, en personas de 65 años o más).
+- **Peso obligatorio** en salto y STS, y se borra con cada **Nuevo participante** (antes se reutilizaba el de la persona anterior y la potencia salía con otro peso). En salto con edad menor de 18 años se avisa que la potencia de Sayers es poco fiable.
+- **N° de participante:** solo letras y números (se usa en los nombres de archivo).
+- **Archivo abierto en Excel:** si `resultados_*.csv` está abierto, el resultado se guarda en `resultados_*_pendiente.csv` y se incorpora solo en la siguiente medición con el archivo cerrado. La pantalla lo indica. Los CSV nuevos se abren en Excel con las tildes correctas.
+- **Salto:** el despegue y el aterrizaje se ubican entre muestras (antes se restaban ~7 ms de vuelo, ≈ −1 cm a 30 cm). La columna `version_algoritmo` distingue los resultados 2.0 de los 2.1.
+- **Giroscopio:** cada aceleración se une a la medición del giroscopio del mismo instante (antes, a la última recibida). El CSV IMU incluye `gyro_emparejado` (1 = emparejado; 0 = se usó el último giroscopio disponible).
+- **Calibrar referencia** guarda una referencia por ubicación del sensor (cadera, muñeca, cintura…) y pide confirmación. Las referencias anteriores (sin ubicación) se descartan: calibre de nuevo.
+- **Plazo de 20 s** en salto, STS y golpe: cuenta desde «¡Ahora!» y ya no corta un movimiento en curso.
+- **Transmisión Bluetooth:** en salto, STS y golpe, menos del 90 % de muestras recibidas invalida el intento, igual que en `reprocesar_datos.py`.
+- **Reconexión:** si el sensor anterior sigue ocupado, la aplicación espera a que lo libere antes de volver a conectar (antes podía cerrarse de golpe).
+
+**Pendiente:** validar con el sensor real. Grabe unos saltos junto a un método de referencia (plataforma de contacto o video a 240 fps) y compruebe que la línea de señal Bluetooth indica *buena*. Si el modelo es MetaMotionS, confirme además que el giroscopio se configura correctamente.
 
 ## Estructura
 

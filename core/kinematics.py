@@ -5,7 +5,8 @@ alguna verificacion "fail" no se debe interpretar: la pantalla pide repetir.
 
 Metodos:
   - Salto: altura por tiempo de vuelo, h = g * t^2 / 8. No requiere integrar
-    ni conocer la orientacion; solo detectar despegue y aterrizaje.
+    ni conocer la orientacion; solo detectar despegue y aterrizaje (punto medio
+    entre la ultima muestra en apoyo y la primera en caida libre).
     Potencia estimada con la ecuacion de Sayers et al. (1999).
   - STS: doble integracion de la aceleracion vertical entre dos reposos, con
     correccion lineal de deriva (velocidad cero al inicio y al final).
@@ -23,7 +24,7 @@ from core.orientation import G
 from core.pipeline import ProcessedSample
 from core.sample_clock import WINDOW_S, reconstruct
 
-ALGORITHM_VERSION = "2.0"
+ALGORITHM_VERSION = "2.1"
 
 # -- Deteccion de reposo / movimiento ----------------------------------------
 REST_WINDOW_SAMPLES = 10       # ventana para la desviacion estandar de |a|
@@ -182,6 +183,9 @@ class RepDetector:
                 "La persona no permaneció quieta 0,5 s antes de moverse. Sin ese reposo no hay "
                 "referencia de gravedad ni velocidad inicial cero."
             )
+        elif self.phase == "moving":
+            detail = ("El movimiento empezó, pero la persona no quedó quieta al terminar. "
+                      "Debe permanecer inmóvil hasta que la pantalla muestre el resultado.")
         else:
             detail = "Hubo reposo, pero no se detectó un movimiento claro."
         return RepResult(self.task, elapsed_s, checks=[Check("Detección del movimiento", "fail", detail)])
@@ -273,14 +277,12 @@ def _analyze_jump(rep, baseline_av, mass_kg):
                             "cadera y que ambos pies dejen el suelo."))
         return [], checks, method
 
-    def crossing(i_a, i_b):
-        # Instante (interpolado) en que |a| cruza el umbral entre las muestras i_a e i_b
-        m_a, m_b = mag[i_a], mag[i_b]
-        frac = (m_a - FREEFALL_G) / (m_a - m_b) if m_a != m_b else 0.5
-        return t[i_a] + frac * (t[i_b] - t[i_a])
-
-    takeoff = crossing(first - 1, first) if first > 0 else t[first]
-    landing = crossing(end - 1, end) if end < len(rep) else t[end - 1]
+    # Despegue y aterrizaje en el punto medio entre la ultima muestra en apoyo y la primera
+    # en vuelo (y viceversa): cada muestra en caida libre representa un intervalo completo.
+    # La interpolacion lineal del umbral suponia una transicion gradual y, con despegues
+    # bruscos, restaba ~0,75 muestras de vuelo (-1 cm a 30 cm).
+    takeoff = 0.5 * (t[first - 1] + t[first]) if first > 0 else t[first]
+    landing = 0.5 * (t[end - 1] + t[end]) if end < len(rep) else t[end - 1]
     flight = float(landing - takeoff)
 
     # Margen de 0,2 s: la posicion de una perdida solo se conoce con la precision de una rafaga.

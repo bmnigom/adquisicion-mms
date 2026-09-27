@@ -14,12 +14,17 @@ def _path() -> str:
 
 
 def load() -> dict:
+    """Configuracion guardada; un archivo danado o incompleto no impide arrancar."""
     config = {"mac_address": DEFAULT_MAC}
     try:
         with open(_path(), encoding="utf-8") as f:
-            config.update(json.load(f))
+            saved = json.load(f)
     except (OSError, ValueError):
-        pass
+        return config
+    if isinstance(saved, dict):
+        config.update(saved)
+    mac = normalize_mac(config["mac_address"]) if isinstance(config["mac_address"], str) else None
+    config["mac_address"] = mac or DEFAULT_MAC
     return config
 
 

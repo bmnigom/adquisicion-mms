@@ -27,7 +27,7 @@ def _write(text: str) -> None:
         print(text, flush=True)
 
 
-def _install_error_handler(app: QApplication) -> None:
+def _install_error_handler() -> None:
     """Un error inesperado queda en data/registro_errores.log y se muestra en pantalla,
     en lugar de cerrar la aplicación sin explicación."""
     def handler(exc_type, exc, tb):
@@ -54,7 +54,7 @@ def main():
     app.setApplicationVersion(__version__)
     base = getattr(sys, "_MEIPASS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "packaging"))
     app.setWindowIcon(QIcon(os.path.join(base, "mms.png")))
-    _install_error_handler(app)
+    _install_error_handler()
 
     from ui.main_window import MainWindow
     if check:
@@ -75,7 +75,14 @@ def main():
             window.close()
             app.exit(0 if ready else 1)
         QTimer.singleShot(1500, finish_check)
-    sys.exit(app.exec())
+    code = app.exec()
+    if window.sensor_threads_alive():
+        # Un hilo sigue bloqueado en el Bluetooth (connect() no se puede interrumpir).
+        # Salir sin destruirlo: Qt abortaria el proceso al destruir un QThread activo.
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        os._exit(code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

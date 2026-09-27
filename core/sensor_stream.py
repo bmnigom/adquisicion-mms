@@ -11,14 +11,18 @@ Cambios de confiabilidad respecto a la version anterior:
     antes el estado seguia en "transmitiendo" aunque el sensor se hubiera caido.
   - Si falla la configuracion despues de conectar, igual se desconecta, para que
     "Reintentar conexion" funcione.
+  - Cada aceleracion se empareja con el giroscopio del mismo instante (ImuPairer),
+    no con el ultimo recibido.
 """
 import os
+import threading
 import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core import simulation, storage
 from core.config import DEFAULT_MAC as MAC_ADDRESS
+from core.imu_pairing import ImuPairer
 from core.sample_clock import SampleClock
 
 SCAN_DURATION_S = 6.0
@@ -69,6 +73,13 @@ class SensorStream(QThread):
         # La cache del SDK va con los datos: la carpeta del programa puede ser de solo lectura.
         device = MetaWear(self.mac_address, cache_path=os.path.join(storage.DATA_DIR, ".metawear"))
         device.connect()
+        if self._stop_requested:
+            # Se pidio detener mientras connect() estaba bloqueado: liberar el sensor ya.
+            try:
+                device.disconnect()
+            finally:
+                self.status_changed.emit("desconectado")
+            return
         disconnected = {"flag": False}
         device.on_disconnect = lambda status: disconnected.update(flag=True)
         self.status_changed.emit("conectado")
@@ -118,23 +129,33 @@ class SensorStream(QThread):
             signals = [acc_signal, gyro_signal]
 
             clock = SampleClock(SAMPLE_RATE_HZ)
-            ultimo_gyro = {"x": 0.0, "y": 0.0, "z": 0.0}
+            pairer = ImuPairer()
+            # Las notificaciones de cada senal pueden llegar por hilos distintos del SDK.
+            lock = threading.Lock()
             last_arrival = {"t": time.perf_counter()}
+
+            def emit(ready):
+                for acc, gyro, (t, host_t, lost), paired in ready:
+                    self.sample_ready.emit({
+                        "time": t, "host_time": host_t, "lost_before": lost,
+                        "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
+                        "gyr_x": gyro[0], "gyr_y": gyro[1], "gyr_z": gyro[2],
+                        "gyro_emparejado": int(paired),
+                    })
 
             def on_gyro(ctx, data):
                 v = parse_value(data)
-                ultimo_gyro["x"], ultimo_gyro["y"], ultimo_gyro["z"] = float(v.x), float(v.y), float(v.z)
+                with lock:
+                    emit(pairer.add_gyro((float(v.x), float(v.y), float(v.z))))
 
             def on_acc(ctx, data):
                 host_t = time.perf_counter()
                 last_arrival["t"] = host_t
                 v = parse_value(data)
-                t, lost = clock.stamp(host_t)
-                self.sample_ready.emit({
-                    "time": t, "host_time": host_t, "lost_before": lost,
-                    "acc_x": float(v.x), "acc_y": float(v.y), "acc_z": float(v.z),
-                    "gyr_x": ultimo_gyro["x"], "gyr_y": ultimo_gyro["y"], "gyr_z": ultimo_gyro["z"],
-                })
+                with lock:
+                    t, lost = clock.stamp(host_t)
+                    emit(pairer.add_acc((float(v.x), float(v.y), float(v.z)), (t, host_t, lost),
+                                        resync=lost > 0))
 
             cb_gyro = FnVoid_VoidP_DataP(on_gyro)
             cb_acc = FnVoid_VoidP_DataP(on_acc)
@@ -277,7 +298,7 @@ class SimulatedSensorStream(QThread):
                 self.sample_ready.emit({
                     "time": t, "host_time": host_t, "lost_before": lost,
                     "acc_x": ax, "acc_y": ay, "acc_z": az,
-                    "gyr_x": gx, "gyr_y": gy, "gyr_z": gz,
+                    "gyr_x": gx, "gyr_y": gy, "gyr_z": gz, "gyro_emparejado": 1,
                 })
                 emitted += 1
             if not announced and emitted:

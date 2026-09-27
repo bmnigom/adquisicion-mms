@@ -35,6 +35,8 @@ class ReportContext:
     age_years: int | None = None
     condition: str = ""
     raw_file: str = ""
+    participant_text: str = ""
+    save_warnings: list[str] = field(default_factory=list)
     timestamp: dt.datetime = field(default_factory=dt.datetime.now)
 
 
@@ -86,6 +88,75 @@ def interpretation_for(mode_key: str) -> list[str]:
     ])
 
 
+def _num(value: float, decimals: int) -> str:
+    """Numero con coma decimal, como se lee en espanol."""
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def participant_summary(mode_key: str, state: str, metrics: list[Metric],
+                        age_years: int | None = None) -> str:
+    """Explicacion breve, en lenguaje llano, para la persona evaluada.
+
+    No diagnostica: solo usa los puntos de referencia ya aplicados en el reporte
+    (STEADI para TUG y EWGSOP2 para marcha, en mayores de 65 años) y remite a un
+    profesional de salud cuando corresponde.
+    """
+    if state == "fail" or not metrics:
+        return ("Este intento no se pudo medir bien (por ejemplo, por la señal del sensor o por "
+                "moverse antes de tiempo). No dice nada sobre ti: lo repetimos.")
+    by_key = {m.key: m.value for m in metrics}
+    older = age_years is not None and age_years >= 65
+    seconds = by_key.get("duration_s", 0.0)
+
+    if mode_key == "jump":
+        text = (f"Saltaste {_num(by_key['altura_salto_cm'], 0)} cm. Lo calculamos con el tiempo que "
+                "estuviste en el aire. Sirve para compararte contigo: entre un intento y otro es "
+                "normal que cambie 1 o 2 cm.")
+    elif mode_key == "sts":
+        text = (f"Al ponerte de pie generaste {_num(by_key['potencia_pico_w'], 0)} W de potencia "
+                f"({_num(by_key['potencia_relativa_w_kg'], 1)} W por kilo de peso). Refleja la fuerza "
+                "y la rapidez de tus piernas, que se entrenan, por ejemplo, levantándote de una silla "
+                "varias veces.")
+    elif mode_key == "punch":
+        speed = by_key["velocidad_pico_m_s"]
+        text = (f"Tu puño alcanzó {_num(speed, 1)} m/s (unos {_num(speed * 3.6, 0)} km/h). Es un "
+                "resultado de juego para comparar tus intentos, no una evaluación de salud.")
+    elif mode_key == "tug":
+        text = f"Tardaste {_num(seconds, 1)} s en levantarte, caminar 3 m, girar, volver y sentarte."
+        if older and seconds >= 12.0:
+            text += (" En personas de 65 años o más, 12 s o más es una señal para revisar el "
+                     "equilibrio y la prevención de caídas con un profesional de salud. No es un "
+                     "diagnóstico.")
+        elif older:
+            text += " Es menos que el punto de referencia de 12 s para personas de 65 años o más."
+        else:
+            text += " Sirve para comparar tus propios resultados en el tiempo."
+    elif mode_key == "walk":
+        speed = by_key.get("velocidad_marcha", 0.0)
+        text = f"Caminaste 5 m a {_num(speed, 2)} m/s (unos {_num(speed * 3.6, 1)} km/h)."
+        if older and speed <= 0.8:
+            text += (" En personas de 65 años o más, 0,8 m/s o menos es una velocidad que conviene "
+                     "comentar con un profesional de salud. No es un diagnóstico.")
+        elif older:
+            text += " Es más que 0,8 m/s, el valor de referencia para personas de 65 años o más."
+    elif mode_key == "stand":
+        text = ("Te mantuviste de pie los 2 minutos completos." if seconds >= 119.5 else
+                f"Te mantuviste de pie {_num(seconds, 0)} s; la prueba busca completar 2 minutos. "
+                "Detenerse antes es válido si lo necesitabas.")
+    elif mode_key == "single_leg":
+        text = (f"Te sostuviste {_num(seconds, 1)} s sobre una pierna. Compáralo con tus próximos "
+                "intentos usando la misma pierna.")
+    elif mode_key == "event":
+        return (f"Registramos {_num(seconds, 0)} segundos de tu movimiento con un sensor que mide "
+                "aceleración y giro, como el de un teléfono. Es una experiencia demostrativa, no una "
+                "evaluación de salud.")
+    else:
+        return ""
+    if state == "warn":
+        text += " El equipo revisará una observación sobre la calidad de la medición."
+    return text
+
+
 def _check_rows(checks: list[Check]) -> str:
     rows = []
     for c in checks:
@@ -116,6 +187,11 @@ def render_html(ctx: ReportContext, standalone: bool = False) -> str:
         f'<span style="{ICON_FONT}">{ICONS[state]}</span> {title}</span><br><span style="font-size:13px;">{escape(action)}</span>'
         f'</td></tr></table>',
     ]
+    for warning in ctx.save_warnings:
+        parts.append(f'<p style="color:{COLORS["warn"]};"><b>Guardado:</b> {escape(warning)}</p>')
+    if ctx.participant_text:
+        parts.append('<h3 style="margin-bottom:4px;">Para la persona evaluada</h3>')
+        parts.append(f'<p style="font-size:15px;">{escape(ctx.participant_text)}</p>')
 
     parts.append('<h3 style="margin-bottom:4px;">Resultados</h3>')
     if state == "fail" or not ctx.metrics:

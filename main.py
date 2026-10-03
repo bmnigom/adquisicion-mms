@@ -27,7 +27,7 @@ def _write(text: str) -> None:
         print(text, flush=True)
 
 
-def _install_error_handler() -> None:
+def _install_error_handler(check: bool = False) -> None:
     """Un error inesperado queda en data/registro_errores.log y se muestra en pantalla,
     en lugar de cerrar la aplicación sin explicación."""
     def handler(exc_type, exc, tb):
@@ -39,6 +39,10 @@ def _install_error_handler() -> None:
         except OSError:
             pass
         _write(details)
+        if check:
+            _write(f"MMS_ERROR: {exc}")
+            QApplication.exit(2)
+            return
         QMessageBox.critical(
             None, "Error inesperado",
             f"Ocurrió un error inesperado:\n\n{exc}\n\nQuedó registrado en:\n{_log_path()}",
@@ -49,12 +53,14 @@ def _install_error_handler() -> None:
 def main():
     check = "--check" in sys.argv
     simulate = check or "--simulate" in sys.argv
+    storage.configure_storage(simulate)
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("Adquisición MMS")
     app.setApplicationVersion(__version__)
     base = getattr(sys, "_MEIPASS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "packaging"))
     app.setWindowIcon(QIcon(os.path.join(base, "mms.png")))
-    _install_error_handler()
+    _install_error_handler(check=check)
 
     from ui.main_window import MainWindow
     if check:
@@ -67,7 +73,8 @@ def main():
             _write(f"MMS_ERROR: biblioteca Bluetooth: {exc}")
             sys.exit(2)
     window = MainWindow(simulate=simulate)
-    window.show()
+    if not check:
+        window.show()
     if check:
         def finish_check():
             ready = window.sensor_status == "transmitiendo"

@@ -1,4 +1,4 @@
-"""Reprocesa los registros IMU grabados con la version anterior (algoritmo 1.x).
+"""Reprocesa registros IMU con el algoritmo actual, sin modificar originales.
 
 No modifica ningun archivo original. Genera:
   - data/reprocesado_datos_anteriores.csv : un renglon por registro, con el
@@ -7,11 +7,19 @@ No modifica ningun archivo original. Genera:
 
 Uso (desde la carpeta del proyecto):
     python reprocesar_datos.py
+    python reprocesar_datos.py --include-current
+
+Por defecto se seleccionan registros 1.x. --include-current permite revisar
+también CSV actuales. Las horas del PC no certifican continuidad ni sincronía:
+sin identidad nativa solo puede informarse una estimación. La masa ausente no
+se recupera del movimiento: se usa 70 kg y la potencia queda como ilustrativa.
 """
+import argparse
 import csv
 import datetime as dt
 import glob
 import os
+import math
 from html import escape
 
 from core import quality as signal_quality
@@ -46,29 +54,61 @@ def load_old_results():
     return old
 
 
-def analyze_file(path, task):
+def analyze_file(path, task, *, include_current=False):
     with open(path, newline="", encoding=storage.CSV_READ_ENCODING) as f:
         rows = list(csv.DictReader(f))
-    if not rows or "host_time" in rows[0]:
+    if not rows or ("host_time" in rows[0] and not include_current):
         return None  # vacio, o ya grabado con la version nueva
-    host = [float(r["time"]) for r in rows]
-    times, lost = reconstruct(host, RATE_HZ)
-    proc = SignalProcessor(RATE_HZ, OLD_ACC_RANGE_G)
+    return analyze_rows(rows, task, acc_range_g=16.0 if "host_time" in rows[0] else OLD_ACC_RANGE_G)
+
+
+def analyze_rows(rows, task, *, mass_kg=None, acc_range_g=OLD_ACC_RANGE_G):
+    """Analiza filas en memoria; conserva metadatos y rechaza datos mal formados.
+
+    device_time son segundos del reloj común del sensor, sequence un índice
+    común verificado. Nunca se promueve host_time/epoch de llegada a nativo.
+    Sin gyro_pairing el registro histórico queda con sincronía desconocida.
+    """
+    timing_error = None
+    try:
+        host = [float(r.get("host_time") or r["time"]) for r in rows]
+        device_times = [r.get("device_time") for r in rows]
+        sequences = [r.get("sequence") for r in rows]
+        times, lost = reconstruct(host, RATE_HZ, device_times=device_times, sequences=sequences)
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        # Un archivo defectuoso debe dejar un veredicto de fallo, sin detener el
+        # resto del lote ni reinterpretar sus tiempos como si fueran correctos.
+        timing_error = str(exc)
+        host = [i / RATE_HZ for i in range(len(rows))]
+        times, lost = reconstruct(host, RATE_HZ)
+    proc = SignalProcessor(RATE_HZ, acc_range_g)
     samples = []
     for r, t, h, k in zip(rows, times, host, lost):
-        s = proc.process({**r, "time": t, "host_time": h, "lost_before": int(k)})
+        record = {**r, "time": t, "host_time": h, "lost_before": int(k)}
+        if timing_error is not None:
+            record["signal_valid"] = False
+        s = proc.process(record)
         samples.append(s)
     q_rows = [{"time": s.t, "host_time": s.host_time, "lost_before": s.lost_before,
-               "saturado": int(s.saturated)} for s in samples]
+               "saturado": int(s.saturated), "signal_valid": s.signal_valid,
+               "gyro_pairing": s.gyro_pairing, "gyro_saturated": s.gyro_saturated,
+               "device_time": s.device_time, "sequence": s.sequence} for s in samples]
     quality = signal_quality.assess(q_rows, RATE_HZ)
-    checks = [signal_quality.transmission_check(quality, strict=task in POWER_TASKS)]
+    checks = [signal_quality.transmission_check(quality, strict=task in POWER_TASKS,
+                                               requires_gyro=task in {"sts", "punch"})]
+    if timing_error is not None:
+        checks.append(Check("Tiempos del registro", "fail", "Información temporal inválida: " + timing_error))
+    if mass_kg is None and task in {"jump", "sts"}:
+        checks.append(Check("Masa de referencia", "warn",
+                            f"Masa no registrada: la potencia usa {DEFAULT_MASS_KG:.0f} kg y es solo ilustrativa; no compare personas."))
     if quality.saturated:
-        checks.append(Check("Saturación (rango ±4 g anterior)", "warn" if task not in POWER_TASKS else "ok",
+        status = "fail" if task == "sts" else "ok" if task == "jump" else "warn"
+        checks.append(Check(f"Saturación (rango ±{acc_range_g:g} g)", status,
                             f"{quality.saturated} muestras en el límite del sensor."))
     if task not in POWER_TASKS:
         return {"quality": quality, "checks": checks, "rep": None}
 
-    detector = RepDetector(task, DEFAULT_MASS_KG, RATE_HZ)
+    detector = RepDetector(task, DEFAULT_MASS_KG if mass_kg is None else mass_kg, RATE_HZ)
     rep = None
     for s in samples:
         _, rep = detector.update(s)
@@ -79,7 +119,7 @@ def analyze_file(path, task):
             rep = detector.timeout_result(quality.duration_s)
             rep.checks = [Check("Reposo final", "fail",
                                 "El registro terminó antes de que la persona quedara quieta; la versión "
-                                "anterior cortaba la captura demasiado pronto.")]
+                                "requiere conservar el reposo final completo.")]
         else:
             rep = detector.timeout_result(quality.duration_s)
     rep.checks = checks + rep.checks
@@ -91,18 +131,25 @@ def _old_text(old: dict | None) -> str:
     if not old:
         return "—"
     try:
-        return (f'{float(old["peak_power_w"]):.0f} W · {float(old["peak_velocity_m_s"]):.2f} m/s · '
-                f'{float(old["max_displacement_m"]) * 100:.0f} cm')
-    except (KeyError, ValueError):
+        power, velocity, displacement = [float(old[key]) for key in
+                                         ("peak_power_w", "peak_velocity_m_s", "max_displacement_m")]
+        if not all(math.isfinite(value) for value in (power, velocity, displacement)):
+            return "—"
+        return f'{power:.0f} W · {velocity:.2f} m/s · {displacement * 100:.0f} cm'
+    except (KeyError, ValueError, TypeError, OverflowError):
         return "—"
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-current", action="store_true",
+                        help="Revisar también registros con host_time; los originales se conservan.")
+    args = parser.parse_args(argv)
     old = load_old_results()
     results = []
     for path in sorted(glob.glob(os.path.join(storage.DATA_DIR, "sub-*_imu.csv"))):
         sub, ses, task, run = parse_name(path)
-        analysis = analyze_file(path, task)
+        analysis = analyze_file(path, task, include_current=args.include_current)
         if analysis is None:
             continue
         rep = analysis["rep"]
@@ -121,7 +168,8 @@ def main():
             "archivo", "sub", "fecha", "task", "run", "veredicto_v2", "motivo",
             "recibidas_pct", "muestras_saturadas",
             "anterior_potencia_w", "anterior_velocidad_m_s", "anterior_desplazamiento_m",
-            "nuevo_metrica", "nuevo_valor", "nuevo_unidad",
+            "nuevo_metrica", "nuevo_valor", "nuevo_unidad", "version_algoritmo",
+            "tiempo_nativo", "muestras_invalidas", "giros_fallback", "giros_inciertos", "giros_saturados",
         ])
         for r in results:
             q, rep, o = r["quality"], r["rep"], r["old"] or {}
@@ -132,6 +180,8 @@ def main():
                 o.get("peak_power_w", ""), o.get("peak_velocity_m_s", ""), o.get("max_displacement_m", ""),
                 primary.label if primary else "", round(primary.value, 2) if primary else "",
                 primary.unit if primary else "",
+                ALGORITHM_VERSION, int(q.timing_native), q.invalid,
+                q.gyro_fallbacks, q.gyro_uncertain, q.gyro_saturated,
             ])
 
     os.makedirs(storage.REPORTS_DIR, exist_ok=True)
@@ -156,9 +206,11 @@ def main():
         "text-align:left;vertical-align:top}th{background:#EEF4F7}</style></head><body>"
         "<h1>Reprocesado de los registros anteriores</h1>"
         f"<p>Generado el {dt.datetime.now():%Y-%m-%d %H:%M} con el algoritmo v{ALGORITHM_VERSION}. "
-        "Los archivos originales no se modificaron. «Recibidas» es el porcentaje de muestras que llegaron "
-        "por Bluetooth (reconstruido a partir de las horas de llegada). La columna «Resultado anterior» "
-        "muestra lo que se guardó en resultados_ciclovia.csv con el algoritmo 1.x. La potencia v2 se "
+        "Los archivos originales no se modificaron. «Recibidas» es una cobertura estimada cuando no hay "
+        "índices o tiempos nativos del sensor: puede omitir pérdidas pequeñas o confundirlas con latencia. "
+        "El orden de llegada de aceleración y giro no demuestra sincronía. Las verificaciones señalan "
+        "parejas inciertas, giros sustituidos, saturación y datos no finitos. La columna «Resultado anterior» "
+        "muestra lo que se guardó en resultados_ciclovia.csv con el algoritmo 1.x. La potencia reprocesada se "
         f"calculó con {DEFAULT_MASS_KG:.0f} kg para todos (el registro anterior no guardaba el peso): "
         "no la compare entre personas.</p>"
         "<table><tr><th>Archivo</th><th>Prueba</th><th>Recibidas</th><th>Resultado anterior</th>"

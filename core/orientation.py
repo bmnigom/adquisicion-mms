@@ -33,8 +33,16 @@ class MahonyAHRS:
         self._e_int = np.zeros(3)
         self._initialized = False
 
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
     def update(self, gyro_rad_s, accel_g, dt: float = 0.01):
         a = np.asarray(accel_g, dtype=float)
+        gyro = np.asarray(gyro_rad_s, dtype=float)
+        if (a.shape != (3,) or gyro.shape != (3,) or not np.isfinite(a).all()
+                or not np.isfinite(gyro).all() or not math.isfinite(dt) or dt <= 0):
+            raise ValueError("La orientación requiere vectores finitos y un intervalo positivo.")
         a_norm = np.linalg.norm(a)
         if not self._initialized:
             if a_norm < 0.5:
@@ -56,7 +64,7 @@ class MahonyAHRS:
             error = np.cross(a, v)
             self._e_int += error * self.ki * dt
 
-        gyro_corr = np.asarray(gyro_rad_s, dtype=float) + self.kp * error + self._e_int
+        gyro_corr = gyro + self.kp * error + self._e_int
         q_dot = 0.5 * _quat_mult(self.q, np.array([0.0, *gyro_corr]))
         self.q = self.q + q_dot * dt
         self.q = self.q / np.linalg.norm(self.q)

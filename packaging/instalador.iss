@@ -1,6 +1,6 @@
 ; Instalador de Adquisicion MMS (Inno Setup 6). Se genera con packaging\construir.cmd.
 #define AppName "Adquisición MMS"
-#define AppVersion "2.1.0"
+#include "app_version.iss"
 #define AppExe "AdquisicionMMS.exe"
 
 [Setup]

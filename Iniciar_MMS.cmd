@@ -8,17 +8,15 @@ if not exist "%APP_DIR%main.py" (
     pause
     exit /b 1
 )
-set "APP_PYTHON=C:\Users\fx517\miniconda3\envs\adquisicion-mms\python.exe"
-if not exist "%APP_PYTHON%" set "APP_PYTHON=%APP_DIR%.venv\Scripts\python.exe"
-if not exist "%APP_PYTHON%" set "APP_PYTHON=%APP_DIR%env\Scripts\python.exe"
-if not exist "%APP_PYTHON%" (
-    echo No se encontro Python para MMS.
-    echo Instale las dependencias indicadas en LEEME.md.
-    pause
-    exit /b 1
+if defined APP_PYTHON goto :run
+if exist "%APP_DIR%.venv\Scripts\python.exe" (
+    set "APP_PYTHON=%APP_DIR%.venv\Scripts\python.exe"
+) else (
+    set "APP_PYTHON=python"
 )
+:run
 pushd "%APP_DIR%"
-"%APP_PYTHON%" "%APP_DIR%main.py" %*
+"%APP_PYTHON%" -X utf8 "%APP_DIR%main.py" %*
 set "APP_EXIT=%ERRORLEVEL%"
 popd
 if not "%APP_EXIT%"=="0" (

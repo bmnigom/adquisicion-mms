@@ -1,14 +1,26 @@
 """Identidad visual y configuración de las pruebas."""
 
-BG = "#F5F7FA"
-BG_PANEL = "#FFFFFF"
-TEXT = "#172B3A"
-TEXT_MUTED = "#637586"
-ACCENT = "#176B84"
-GOOD = "#247A64"
-WARN = "#A56819"
-BAD = "#B44949"
-BORDER = "#DCE4EA"
+BG = "#0B1420"
+BG_PANEL = "#121F2E"
+TEXT = "#E6EDF5"
+TEXT_MUTED = "#9CB0C3"
+ACCENT = "#43D5CE"
+GOOD = "#68D8A0"
+WARN = "#F3C778"
+BAD = "#FF8990"
+BORDER = "#24364A"
+NAVY = "#132D40"
+SOFT_ACCENT = "#16343E"
+
+MODE_SUMMARIES = {
+    "tug": "Levantarse, caminar 3 m y volver a sentarse.",
+    "sts": "Potencia y velocidad al levantarse de la silla.",
+    "walk": "Tiempo y velocidad media en un recorrido de 5 m.",
+    "stand": "Registro de equilibrio durante dos minutos.",
+    "single_leg": "Duración del apoyo sobre una pierna.",
+    "jump": "Altura de salto a partir del tiempo de vuelo.",
+    "punch": "Velocidad del puño y aceleración de la muñeca.",
+}
 
 MODES = {
     "event": {
@@ -101,46 +113,64 @@ MODES = {
 }
 
 STYLESHEET = f"""
-QWidget {{ background-color: {BG}; color: {TEXT}; font-family: Arial; font-size: 14px; }}
+QWidget {{ background-color: {BG}; color: {TEXT}; font-family: 'Segoe UI'; font-size: 14px; }}
+QLabel {{ background: transparent; }}
+QFrame#appHeader {{ background: {BG_PANEL}; border-bottom: 1px solid {BORDER}; }}
+QFrame#appHeader QLabel {{ background: transparent; }}
+QLabel#brand {{ font-size: 24px; font-weight: 700; color: {TEXT}; }}
+QLabel#brandSubtitle {{ font-size: 11px; color: {TEXT_MUTED}; }}
+QLabel#simulationTag {{ color: {WARN}; background: #3C3020; padding: 6px 10px; border-radius: 7px; font-size: 11px; font-weight: 700; }}
 QFrame#panel, QFrame#modeCard, QFrame#metricCard {{
-    background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 14px;
+    background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 16px;
 }}
-QFrame#panel QLabel {{ background: transparent; border: none; }}
-QLabel#eyebrow {{ color: {ACCENT}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
-QLabel#title {{ color: {TEXT}; font-size: 31px; font-weight: 700; }}
-QLabel#sectionTitle {{ color: {TEXT}; font-size: 20px; font-weight: 650; }}
+QFrame#panel QLabel, QFrame#modeCard QLabel, QFrame#metricCard QLabel {{ background: transparent; border: none; }}
+QFrame#modeCard:hover {{ border: 1px solid #98C6CD; }}
+QFrame#hero {{ background-color: {NAVY}; border: none; border-radius: 20px; }}
+QFrame#hero QLabel {{ background: transparent; color: white; }}
+QFrame#hero QLabel#eyebrow {{ color: #91DADB; }}
+QFrame#hero QLabel#eventLead {{ color: #D0E1E9; font-size: 16px; }}
+QFrame#hero QLabel#eventNumber {{ color: #91DADB; font-size: 84px; font-weight: 300; }}
+QLabel#eyebrow {{ color: {ACCENT}; font-size: 11px; font-weight: 700; }}
+QLabel#title {{ color: {TEXT}; font-size: 30px; font-weight: 600; }}
+QLabel#sectionTitle {{ color: {TEXT}; font-size: 19px; font-weight: 600; }}
 QLabel#subtitle, QLabel#muted {{ color: {TEXT_MUTED}; font-size: 14px; }}
-QLabel#metricValue {{ color: {TEXT}; font-size: 29px; font-weight: 700; }}
-QStatusBar {{ background-color: {BG}; border-top: 1px solid {BORDER}; min-height: 28px; }}
+QLabel#metricValue {{ color: {TEXT}; font-size: 34px; font-weight: 600; }}
+QLabel#stepActive {{ color: {ACCENT}; background: {SOFT_ACCENT}; border-radius: 7px; padding: 7px 12px; font-size: 12px; font-weight: 600; }}
+QLabel#stepInactive {{ color: {TEXT_MUTED}; padding: 7px 12px; font-size: 12px; }}
+QLabel#formHint {{ color: {TEXT_MUTED}; font-size: 12px; }}
+QStatusBar {{ background-color: {BG_PANEL}; min-height: 26px; }}
 QStatusBar::item {{ border: none; }}
 QLabel#signature {{ color: {TEXT_MUTED}; background: transparent; font-size: 12px; }}
-QLabel#eventTitle {{ color: {TEXT}; font-size: 43px; font-weight: 700; }}
-QLabel#eventLead {{ color: {TEXT_MUTED}; font-size: 19px; }}
-QLabel#eventNumber {{ color: {ACCENT}; font-size: 60px; font-weight: 700; }}
-QPushButton#eventButton {{ background-color: {ACCENT}; color: white; border: 1px solid {ACCENT}; border-radius: 12px; padding: 14px 24px; font-size: 20px; font-weight: 700; min-height: 30px; }}
-QPushButton#eventButton:hover {{ background-color: #11576C; }}
-QPushButton#eventButton:disabled {{ background-color: #AFC3CC; color: #F5F7FA; border-color: #AFC3CC; }}
+QLabel#eventTitle {{ font-size: 40px; font-weight: 600; }}
+QLabel#eventLead {{ color: {TEXT_MUTED}; font-size: 17px; }}
+QPushButton#eventButton {{ background-color: {ACCENT}; color: {BG}; border: 1px solid {ACCENT}; border-radius: 10px; padding: 12px 24px; font-size: 17px; font-weight: 600; min-height: 22px; }}
+QPushButton#eventButton:hover, QPushButton#primaryButton:hover {{ background-color: #80E5DF; }}
 QScrollArea {{ border: none; background: transparent; }}
 QScrollBar:vertical {{ background: transparent; width: 9px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: #C4D0D8; border-radius: 4px; min-height: 28px; }}
+QScrollBar::handle:vertical {{ background: #3B5268; border-radius: 4px; min-height: 28px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 QPushButton {{
-    background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 11px 18px; font-size: 14px; font-weight: 600;
+    background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 9px;
+    padding: 9px 16px; font-size: 14px; font-weight: 600; min-height: 20px;
 }}
-QPushButton:hover {{ background-color: #EAF1F4; border-color: {ACCENT}; }}
-QPushButton:pressed {{ background-color: #D7E5EB; }}
-QPushButton#primaryButton {{ background-color: {ACCENT}; color: white; border-color: {ACCENT}; }}
-QPushButton#primaryButton:hover {{ background-color: #11576C; }}
+QPushButton:hover {{ background-color: {SOFT_ACCENT}; border-color: #36848D; }}
+QPushButton:pressed {{ background-color: #23505B; }}
+QPushButton:focus {{ border: 2px solid {ACCENT}; }}
+QPushButton:disabled, QPushButton#primaryButton:disabled, QPushButton#eventButton:disabled {{ background: #213246; color: #8297AA; border-color: #213246; }}
+QPushButton#primaryButton {{ background-color: {ACCENT}; color: {BG}; border-color: {ACCENT}; padding: 10px 22px; }}
+QPushButton#navButton {{ background: transparent; border: none; padding: 8px 12px; color: {TEXT_MUTED}; font-size: 13px; }}
+QPushButton#navButton:hover {{ color: {ACCENT}; background: {SOFT_ACCENT}; }}
 QPushButton#modeButton {{
-    background-color: {BG_PANEL}; border: 1px solid {BORDER}; border-radius: 12px;
-    padding: 14px; text-align: left; font-size: 16px; font-weight: 650;
+    background-color: {SOFT_ACCENT}; color: {ACCENT}; border: none; border-radius: 8px;
+    padding: 9px 14px; text-align: left; font-size: 13px; font-weight: 600;
 }}
-QPushButton#modeButton:hover {{ border-color: {ACCENT}; background-color: #EDF4F6; }}
+QPushButton#modeButton:hover {{ background-color: #23505B; }}
 QDoubleSpinBox, QSpinBox, QLineEdit, QComboBox {{
-    background-color: white; border: 1px solid #C6D2D9; border-radius: 7px;
-    padding: 9px 11px; min-height: 20px; font-size: 15px;
+    background-color: #0D1A28; border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 8px 11px; min-height: 22px; font-size: 15px;
 }}
 QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
+QTextBrowser {{ background: {BG_PANEL}; color: {TEXT}; border: 1px solid {BORDER}; border-radius: 12px; padding: 12px; font-size: 13px; }}
+QToolTip {{ background: {NAVY}; color: {TEXT}; border: 1px solid {BORDER}; padding: 7px 10px; }}
 """

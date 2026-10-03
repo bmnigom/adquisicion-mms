@@ -6,6 +6,7 @@ en la aplicacion (Qt rich text: solo tablas y estilos simples) y se guarda en
 data/reportes para revisarlo despues.
 """
 import datetime as dt
+import math
 from dataclasses import dataclass, field
 from html import escape
 
@@ -38,6 +39,8 @@ class ReportContext:
     participant_text: str = ""
     save_warnings: list[str] = field(default_factory=list)
     timestamp: dt.datetime = field(default_factory=dt.datetime.now)
+    session_id: str = ""
+    data_source: str = "sensor"
 
 
 def verdict(checks: list[Check], has_metrics: bool) -> tuple[str, str, str]:
@@ -50,6 +53,35 @@ def verdict(checks: list[Check], has_metrics: bool) -> tuple[str, str, str]:
     if warns:
         return "warn", "Válida con observaciones", "Revise las observaciones antes de interpretar o comparar."
     return "ok", "Medición válida", "Todas las verificaciones de calidad fueron correctas."
+
+
+def effective_checks(ctx: ReportContext) -> list[Check]:
+    """Alinea el veredicto de pantalla, CSV y HTML frente a valores no finitos."""
+    checks = list(ctx.checks)
+    def finite(value):
+        try:
+            return value is None or math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+    bad_metrics = [m.label for m in ctx.metrics if m.value is None or not finite(m.value)]
+    if ctx.duration_s is not None and not finite(ctx.duration_s):
+        bad_metrics.append("duración")
+    if bad_metrics and not any(c.label == "Resultados numéricos" for c in checks):
+        checks.append(Check("Resultados numéricos", "fail",
+                            "El cálculo produjo valores no finitos: " + ", ".join(bad_metrics) + ". Repita la captura."))
+    return checks
+
+
+def _finite_metrics(metrics: list[Metric]) -> bool:
+    try:
+        return all(math.isfinite(float(m.value)) for m in metrics)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def measurement_verdict(ctx: ReportContext) -> tuple[str, str, str]:
+    checks = effective_checks(ctx)
+    return verdict(checks, bool(ctx.metrics) and _finite_metrics(ctx.metrics))
 
 
 def interpretation_for(mode_key: str) -> list[str]:
@@ -168,14 +200,15 @@ def _check_rows(checks: list[Check]) -> str:
 
 
 def render_html(ctx: ReportContext, standalone: bool = False) -> str:
-    state, title, action = verdict(ctx.checks, bool(ctx.metrics))
+    checks = effective_checks(ctx)
+    state, title, action = verdict(checks, bool(ctx.metrics) and _finite_metrics(ctx.metrics))
     stamp = ctx.timestamp.strftime("%Y-%m-%d %H:%M")
     who = [f"Participante <b>{escape(ctx.sub)}</b>", f"intento {escape(ctx.run)}", stamp,
            f"sensor: {escape(ctx.sensor_pos.lower())}"]
     if ctx.age_years:
         who.append(f"{ctx.age_years} años")
     if ctx.mass_kg:
-        who.append(f"{ctx.mass_kg:.0f} kg")
+        who.append(f"{ctx.mass_kg:g} kg")
     if ctx.condition:
         who.append(escape(ctx.condition))
 
@@ -187,6 +220,8 @@ def render_html(ctx: ReportContext, standalone: bool = False) -> str:
         f'<span style="{ICON_FONT}">{ICONS[state]}</span> {title}</span><br><span style="font-size:13px;">{escape(action)}</span>'
         f'</td></tr></table>',
     ]
+    if ctx.data_source == "simulacion":
+        parts.insert(0, '<p style="color:#A56819;font-weight:700;">SIMULACIÓN · Datos sintéticos de demostración</p>')
     for warning in ctx.save_warnings:
         parts.append(f'<p style="color:{COLORS["warn"]};"><b>Guardado:</b> {escape(warning)}</p>')
     if ctx.participant_text:
@@ -224,23 +259,32 @@ def render_html(ctx: ReportContext, standalone: bool = False) -> str:
         parts.append(ctx.comparison_html)
 
     parts.append('<h3 style="margin-bottom:4px;">Calidad de la medición</h3>')
-    parts.append(f'<table width="100%" cellpadding="4" cellspacing="0">{_check_rows(ctx.checks)}</table>')
+    parts.append(f'<table width="100%" cellpadding="4" cellspacing="0">{_check_rows(checks)}</table>')
 
     if ctx.method:
         parts.append('<h3 style="margin-bottom:4px;">Método</h3>')
         parts.append(f'<p style="color:#637586;">{escape(ctx.method)}</p>')
     footer = f"Algoritmo v{ALGORITHM_VERSION}."
+    if ctx.session_id:
+        footer += f" Sesión: {escape(ctx.session_id)}."
     if ctx.raw_file:
         footer += f" Datos IMU: {escape(ctx.raw_file)}"
     parts.append(f'<p style="color:#637586; font-size:11px;">{footer}</p>')
 
     body = "\n".join(parts)
     if not standalone:
-        return body
+        palette = {
+            "#637586": "#9CB0C3", "#247A64": "#68D8A0", "#A56819": "#F3C778",
+            "#B44949": "#FF8990", "#E6F2EE": "#153C32", "#FBF1E3": "#3C3020",
+            "#F8E6E6": "#3C252D",
+        }
+        for before, after in palette.items():
+            body = body.replace(before, after)
+        return f'<div style="color:#E6EDF5;font-family:Segoe UI;">{body}</div>'
     return (
         "<!doctype html><html lang='es'><head><meta charset='utf-8'>"
         f"<title>Reporte {escape(ctx.test_label)} · {escape(ctx.sub)}</title>"
-        "<style>body{font-family:Arial,sans-serif;color:#172B3A;max-width:820px;margin:32px auto;"
+        "<style>body{font-family:Segoe UI,Arial,sans-serif;color:#172B3A;max-width:820px;margin:32px auto;"
         "padding:0 16px;line-height:1.45}td{vertical-align:top;border-bottom:1px solid #EEF2F5}"
         "h1{margin-bottom:4px}</style></head><body>"
         f"<h1>{escape(ctx.test_label)}</h1>{body}</body></html>"

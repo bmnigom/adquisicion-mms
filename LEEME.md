@@ -4,7 +4,7 @@ La aplicación usa PyQt6 y puede iniciarse sin PyCharm en este equipo.
 
 ## Instalar en otro computador
 
-Use el instalador `AdquisicionMMS-2.1.0-instalador.exe` (sección *Releases* del repositorio en GitHub, o `dist\instalador` tras construirlo con `packaging\construir.cmd`). No requiere Python ni permisos de administrador. Requiere Windows 10/11 con Bluetooth. Si SmartScreen muestra «Windows protegió su PC», elija **Más información → Ejecutar de todas formas** (el instalador no está firmado).
+Use el instalador `AdquisicionMMS-2.2.0-instalador.exe` (sección *Releases* del repositorio en GitHub, o `dist\instalador` tras construirlo con `packaging\construir.cmd`). No requiere Python ni permisos de administrador. Requiere Windows 10/11 con Bluetooth. Si SmartScreen muestra «Windows protegió su PC», elija **Más información → Ejecutar de todas formas** (el instalador no está firmado).
 
 Tras instalar, abra **Adquisición MMS** desde el menú Inicio, encienda el sensor y use **Configurar sensor → Buscar sensores** para elegir el sensor de ese equipo (también puede escribir la dirección MAC). La elección se guarda en `%LOCALAPPDATA%\AdquisicionMMS\data\configuracion.json`. El menú Inicio incluye además el modo de simulación y un acceso a la carpeta de datos y reportes. Si ocurre un error inesperado, queda registrado en `registro_errores.log` dentro de esa carpeta.
 
@@ -84,7 +84,7 @@ La versión anterior calculaba potencia, velocidad y desplazamiento de forma no 
 
 `data/resultados_ciclovia.csv` se conserva como histórico del algoritmo anterior y **no debe usarse**. El script `reprocesar_datos.py` analiza de nuevo los registros antiguos con el algoritmo nuevo, sin modificarlos, y genera `data/reprocesado_datos_anteriores.csv` y `data/reportes/reprocesado_datos_anteriores.html`. Los archivos originales previos a estos cambios están en `respaldo_2026-09-25/`.
 
-Las pruebas de los algoritmos (señales sintéticas de valor conocido) se ejecutan con `python -m tests.test_algoritmos`.
+La suite de algoritmos, almacenamiento, Bluetooth simulado e integración visual se ejecuta con `python -m unittest discover -s tests -v`.
 
 ## Cambios del algoritmo 2.1 (septiembre 2026)
 

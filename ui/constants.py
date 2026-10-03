@@ -1,0 +1,7 @@
+"""Shared acquisition and display settings."""
+PLOT_WINDOW_S = 4.0
+SAMPLE_RATE_HZ = 100.0
+NO_REP_TIMEOUT_MS = 20_000
+PLOT_REFRESH_MS = 33
+LINK_WINDOW_S = 2.0
+MIN_MASS_KG = 15.0

@@ -1,0 +1,27 @@
+name: MMS Windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -X utf8 -m unittest discover -s tests -v
+      - run: python -X utf8 main.py --check
+      - run: python -X utf8 packaging/build.py --no-installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdquisicionMMS-Windows
+          path: dist/AdquisicionMMS/

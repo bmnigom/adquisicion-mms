@@ -9,6 +9,9 @@ import os
 import random
 import sys
 import tempfile
+import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import numpy as np
 
@@ -58,190 +61,221 @@ def run_detector(task, raw, mass=70.0, drop=None, stall=None, rng_seed=1):
     return result, clock.stats
 
 
-def check(name, cond, detail=""):
-    cond = bool(cond)
-    print(("OK   " if cond else "FALLA") + f"  {name}  {detail}")
-    return cond
+class AlgorithmTests(unittest.TestCase):
+    def assert_valid_rep(self, rep):
+        self.assertIsNotNone(rep, "El detector no produjo un resultado")
+        self.assertTrue(rep.valid, "; ".join(c.detail for c in rep.checks if c.status == "fail"))
+
+    def metric_value(self, rep, key):
+        self.assertIsNotNone(rep)
+        metric = rep.metric(key)
+        self.assertIsNotNone(metric, f"Falta la métrica {key}")
+        return metric.value
+
+    def test_bluetooth_bursts_do_not_create_false_losses(self):
+        raw = sim.to_sensor_samples(sim.sts_profile(0.4), seed=1)
+        _, stats = run_detector("sts", raw)
+        self.assertEqual(stats.lost, 0)
+
+    def test_orientation_initializes_from_first_gravity_vector(self):
+        ahrs = MahonyAHRS()
+        a = sim.to_sensor_samples([], roll_deg=30, pitch_deg=-20, noise_g=0, rest_before_s=0.01)[0][:3]
+        ahrs.update([0, 0, 0], a)
+        np.testing.assert_allclose(ahrs.rotate_to_world(a), [0, 0, 1], atol=1e-6)
+
+    def test_placement_comparison_ignores_yaw(self):
+        yaw90 = np.array([math.cos(math.pi / 4), 0, 0, math.sin(math.pi / 4)])
+        self.assertLess(tilt_angle_diff_deg([1, 0, 0, 0], yaw90), 1e-6)
+
+    def test_jump_height_for_known_profiles(self):
+        for height in (0.15, 0.30, 0.45):
+            with self.subTest(height_cm=height * 100):
+                raw = sim.to_sensor_samples(sim.jump_profile(height), seed=2)
+                rep, _ = run_detector("jump", raw)
+                self.assert_valid_rep(rep)
+                # El vuelo se redondea a muestras enteras (hasta ±0,6 cm).
+                self.assertLess(abs(self.metric_value(rep, "altura_salto_cm") - height * 100), 1.0)
+
+    def test_jump_rejects_samples_lost_during_flight(self):
+        raw = sim.to_sensor_samples(sim.jump_profile(0.30), seed=3)
+        flight_idx = 100 + 25 + 35 + 10
+        for n_lost in (5, 8):
+            with self.subTest(lost_samples=n_lost):
+                rep, _ = run_detector("jump", raw, drop=(flight_idx, flight_idx + n_lost))
+                self.assertIsNotNone(rep)
+                self.assertFalse(rep.valid)
+
+    def test_jump_accepts_host_stall_without_sample_loss(self):
+        raw = sim.to_sensor_samples(sim.jump_profile(0.30), seed=3)
+        flight_idx = 100 + 25 + 35 + 10
+        rep, _ = run_detector("jump", raw, stall=(flight_idx / RATE, 0.3))
+        self.assert_valid_rep(rep)
+        self.assertLess(abs(self.metric_value(rep, "altura_salto_cm") - 30), 1.0)
+
+    def test_sts_displacement_and_power_for_known_profiles(self):
+        for rise in (0.30, 0.45):
+            with self.subTest(rise_cm=rise * 100):
+                raw = sim.to_sensor_samples(sim.sts_profile(rise, 1.0), seed=4)
+                rep, _ = run_detector("sts", raw, mass=70)
+                self.assert_valid_rep(rep)
+                displacement = self.metric_value(rep, "desplazamiento_cm")
+                power = self.metric_value(rep, "potencia_pico_w")
+                # Potencia física de referencia: max(m (a+g) v), perfil min-jerk.
+                s = np.linspace(0, 1, 2000)
+                velocity = rise * (30 * s ** 2 - 60 * s ** 3 + 30 * s ** 4)
+                acceleration = rise * (60 * s - 180 * s ** 2 + 120 * s ** 3)
+                expected_power = float((70 * (acceleration + 9.81) * velocity).max())
+                self.assertLess(abs(displacement - rise * 100), 3)
+                self.assertLess(abs(power - expected_power) / expected_power, 0.08)
+
+    def test_punch_speed_matches_known_profile(self):
+        raw = sim.to_sensor_samples(sim.punch_profile(0.5, 0.2), seed=5)
+        rep, _ = run_detector("punch", raw)
+        self.assert_valid_rep(rep)
+        speed = self.metric_value(rep, "velocidad_pico_m_s")
+        expected = sim.punch_peak_speed(0.5, 0.2)
+        self.assertLess(abs(speed - expected) / expected, 0.1)
+
+    def test_detector_does_not_measure_without_initial_rest(self):
+        det = RepDetector("jump", 70, RATE)
+        self.assertFalse(det.timeout_result(15).valid)
+
+    def test_timeout_explains_unfinished_motion(self):
+        det = RepDetector("jump", 70, RATE)
+        det.phase = "moving"
+        self.assertIn("no quedó quieta", det.timeout_result(20).checks[0].detail)
+
+
+class PairingTests(unittest.TestCase):
+    def test_fifo_preserves_order_across_alternating_bursts(self):
+        pairer = ImuPairer()
+        out = pairer.add_gyro(("pre",) * 3)
+        for k in range(0, 30, 3):
+            if k % 6 == 0:
+                for i in range(k, k + 3):
+                    out += pairer.add_acc((i,) * 3, i)
+                for i in range(k, k + 3):
+                    out += pairer.add_gyro((i,) * 3)
+            else:
+                for i in range(k, k + 3):
+                    out += pairer.add_gyro((i,) * 3)
+                for i in range(k, k + 3):
+                    out += pairer.add_acc((i,) * 3, i)
+        self.assertEqual(len(out), 30)
+        for index, (acc, gyro, _, paired) in enumerate(out):
+            with self.subTest(index=index):
+                self.assertEqual(acc[0], gyro[0])
+                self.assertTrue(paired)
+
+    def test_missing_gyro_does_not_retain_acceleration_indefinitely(self):
+        pairer = ImuPairer()
+        out = []
+        for i in range(20):
+            out += pairer.add_acc((i,) * 3, i)
+        self.assertEqual(len(out), 20 - pairer.max_wait)
+        self.assertEqual(pairer.fallbacks, len(out))
+
+
+@contextmanager
+def temporary_data_dir(simulate=False):
+    """Restore every storage selector, including simulation/config paths."""
+    names = ("BASE_DATA_DIR", "DATA_SOURCE", "DATA_DIR", "RESULTS_LOG", "TIMED_RESULTS_LOG",
+             "REFERENCE_ORIENTATION_FILE", "REPORTS_DIR")
+    original = {name: getattr(storage, name) for name in names}
+    with tempfile.TemporaryDirectory() as tmp, patch.multiple(storage, **original):
+        storage.configure_storage(simulate, base_dir=tmp)
+        yield tmp
+
+
+class StorageAndConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(temporary_data_dir())
+
+    def test_normalizes_valid_participant_ids(self):
+        for supplied, expected in (("7", "07"), ("AB12", "AB12")):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(storage.normalize_sub(supplied), expected)
+
+    def test_rejects_ids_with_path_characters(self):
+        for value in ("3/4", "a_b", "..", "c:", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(storage.normalize_sub(value))
+
+    def test_locked_csv_retains_previous_value_and_recovers_pending_rows(self):
+        from core.timed_capture import TimedResult
+        real_write = storage._write_rows
+        def locked(path, header, rows):
+            if path == storage.TIMED_RESULTS_LOG:
+                raise PermissionError(13, "Permission denied")
+            return real_write(path, header, rows)
+        with patch.object(storage, "_write_rows", side_effect=locked):
+            warning = storage.append_timed_result("01", "tug", "01", TimedResult(10.5, 900, "manual"))
+        pending = storage._pending_path(storage.TIMED_RESULTS_LOG)
+        self.assertIn("Excel", warning)
+        self.assertTrue(os.path.exists(pending))
+        self.assertEqual(storage.previous_value("01", "tug", timed=True), 10.5)
+        warning = storage.append_timed_result("01", "tug", "02", TimedResult(9.8, 900, "manual"))
+        with open(storage.TIMED_RESULTS_LOG, encoding="utf-8-sig") as handle:
+            lines = handle.read().splitlines()
+        self.assertEqual(warning, "")
+        self.assertEqual(len(lines), 3)
+        self.assertFalse(os.path.exists(pending))
+        with open(storage.TIMED_RESULTS_LOG, "rb") as handle:
+            self.assertEqual(handle.read(3), b"\xef\xbb\xbf")
+
+    def test_report_only_attempt_number_is_not_reused(self):
+        storage.save_report("01", "jump", "01", "<p>sin datos</p>")
+        self.assertEqual(storage.next_run_number("01", "jump"), "02")
+
+    def test_damaged_reference_is_ignored_and_locations_are_independent(self):
+        with open(storage.REFERENCE_ORIENTATION_FILE, "w", encoding="utf-8") as handle:
+            handle.write("{no es json")
+        self.assertIsNone(storage.load_reference_orientation("Muñeca"))
+        storage.save_reference_orientation("Muñeca", [1, 0, 0, 0])
+        self.assertEqual(storage.load_reference_orientation("Muñeca"), [1, 0, 0, 0])
+        self.assertIsNone(storage.load_reference_orientation("Cintura"))
+
+    def test_damaged_config_uses_defaults(self):
+        with open(os.path.join(self.tmp, "configuracion.json"), "w", encoding="utf-8") as handle:
+            json.dump(["no", "es", "un", "dict"], handle)
+        self.assertEqual(config.load()["mac_address"], config.DEFAULT_MAC)
+
+    def test_simulation_has_its_own_sensor_configuration(self):
+        real_mac, simulated_mac = "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"
+        config.save({"mac_address": real_mac})
+        storage.configure_storage(True, base_dir=self.tmp)
+        self.assertEqual(config.load()["mac_address"], config.DEFAULT_MAC)
+        config.save({"mac_address": simulated_mac})
+        self.assertEqual(config.load()["mac_address"], simulated_mac)
+        storage.configure_storage(False)
+        self.assertEqual(config.load()["mac_address"], real_mac)
+
+
+class ParticipantTextTests(unittest.TestCase):
+    def test_tug_threshold_for_older_adults_refers_to_a_professional(self):
+        metrics = [Metric("duration_s", "Tiempo", 13.2, "s")]
+        text = participant_summary("tug", "ok", metrics, 70)
+        self.assertIn("profesional de salud", text)
+        self.assertIn("No es un diagnóstico", text)
+
+    def test_tug_without_age_does_not_apply_age_specific_threshold(self):
+        metrics = [Metric("duration_s", "Tiempo", 13.2, "s")]
+        self.assertNotIn("12 s", participant_summary("tug", "ok", metrics, None))
+
+    def test_normal_walk_speed_has_no_alarm_for_older_adults(self):
+        metrics = [Metric("duration_s", "Tiempo", 5.0, "s"), Metric("velocidad_marcha", "Velocidad", 1.0, "m/s")]
+        self.assertNotIn("profesional", participant_summary("walk", "ok", metrics, 70))
+
+    def test_invalid_attempt_does_not_show_metric_values(self):
+        metrics = [Metric("duration_s", "Tiempo", 13.2, "s")]
+        self.assertNotIn("13", participant_summary("tug", "fail", metrics, 70))
 
 
 def main():
-    ok = True
-
-    # Reloj: rafagas sin perdidas no deben contarse como perdidas
-    raw = sim.to_sensor_samples(sim.sts_profile(0.4), seed=1)
-    _, stats = run_detector("sts", raw)
-    ok &= check("Reloj sin falsas pérdidas", stats.lost == 0, f"perdidas={stats.lost}")
-
-    # Orientacion inicial correcta desde el primer vector de gravedad
-    ahrs = MahonyAHRS()
-    a = sim.to_sensor_samples([], roll_deg=30, pitch_deg=-20, noise_g=0, rest_before_s=0.01)[0][:3]
-    ahrs.update([0, 0, 0], a)
-    ok &= check("Inicialización por gravedad", np.allclose(ahrs.rotate_to_world(a), [0, 0, 1], atol=1e-6))
-
-    # Colocacion: girar alrededor de la vertical no cambia la inclinacion
-    yaw90 = np.array([math.cos(math.pi / 4), 0, 0, math.sin(math.pi / 4)])
-    ok &= check("Colocación ignora el rumbo", tilt_angle_diff_deg([1, 0, 0, 0], yaw90) < 1e-6)
-
-    for h in (0.15, 0.30, 0.45):
-        raw = sim.to_sensor_samples(sim.jump_profile(h), seed=2)
-        rep, _ = run_detector("jump", raw)
-        got = rep.metric("altura_salto_cm").value if rep and rep.valid else float("nan")
-        # Tolerancia 1 cm: la simulacion redondea el vuelo a muestras enteras (hasta ±0,6 cm).
-        ok &= check(f"Salto {h * 100:.0f} cm", abs(got - h * 100) < 1.0, f"medido={got:.1f} cm")
-
-    raw = sim.to_sensor_samples(sim.jump_profile(0.30), seed=3)
-    flight_idx = 100 + 25 + 35 + 10  # reposo 1 s + contramovimiento + impulso + 0,1 s de vuelo
-    for n_lost in (5, 8):
-        rep, _ = run_detector("jump", raw, drop=(flight_idx, flight_idx + n_lost))
-        ok &= check(f"Salto con {n_lost} muestras perdidas en el vuelo se rechaza",
-                    rep is not None and not rep.valid,
-                    "; ".join(c.detail for c in rep.checks if c.status == "fail") if rep else "sin resultado")
-    rep, _ = run_detector("jump", raw, stall=(flight_idx / RATE, 0.3))
-    got = rep.metric("altura_salto_cm").value if rep and rep.valid else float("nan")
-    ok &= check("Salto con PC bloqueado 300 ms (sin pérdida) se acepta", abs(got - 30) < 1.0,
-                f"medido={got:.1f} cm")
-
-    for rise in (0.30, 0.45):
-        raw = sim.to_sensor_samples(sim.sts_profile(rise, 1.0), seed=4)
-        rep, _ = run_detector("sts", raw, mass=70)
-        d = rep.metric("desplazamiento_cm").value if rep else float("nan")
-        p = rep.metric("potencia_pico_w").value if rep else float("nan")
-        # Potencia teorica: max(m (a+g) v) del perfil min-jerk
-        T, n = 1.0, 2000
-        s = np.linspace(0, 1, n)
-        v = rise / T * (30 * s ** 2 - 60 * s ** 3 + 30 * s ** 4)
-        acc = rise / T ** 2 * (60 * s - 180 * s ** 2 + 120 * s ** 3)
-        p_true = float((70 * (acc + 9.81) * v).max())
-        ok &= check(f"STS ascenso {rise * 100:.0f} cm", rep and rep.valid and abs(d - rise * 100) < 3,
-                    f"medido={d:.1f} cm")
-        ok &= check(f"STS potencia ({p_true:.0f} W teórica)", rep and abs(p - p_true) / p_true < 0.08,
-                    f"medido={p:.0f} W")
-
-    raw = sim.to_sensor_samples(sim.punch_profile(0.5, 0.2), seed=5)
-    rep, _ = run_detector("punch", raw)
-    v_true = sim.punch_peak_speed(0.5, 0.2)
-    v = rep.metric("velocidad_pico_m_s").value if rep else float("nan")
-    ok &= check(f"Golpe velocidad ({v_true:.2f} m/s teórica)", rep and rep.valid and abs(v - v_true) / v_true < 0.1,
-                f"medido={v:.2f} m/s")
-
-    # Sin reposo previo no se arma el detector
-    det = RepDetector("jump", 70, RATE)
-    ok &= check("Sin reposo previo no mide", det.timeout_result(15).valid is False)
-    det.phase = "moving"
-    ok &= check("Límite con movimiento en curso lo explica",
-                "no quedó quieta" in det.timeout_result(20).checks[0].detail)
-
-    ok &= test_pairing()
-    ok &= test_storage_and_config()
-    ok &= test_participant_text()
-
-    print("\nTODAS LAS PRUEBAS PASARON" if ok else "\nHAY PRUEBAS FALLIDAS")
-    return 0 if ok else 1
-
-
-def test_pairing():
-    ok = True
-    # Paquetes de 3 muestras, giroscopio iniciado antes y llegando a veces antes, a veces despues.
-    p = ImuPairer()
-    out = p.add_gyro(("pre",) * 3)  # anterior a la primera aceleracion: se descarta
-    for k in range(0, 30, 3):
-        if k % 6 == 0:
-            for i in range(k, k + 3):
-                out += p.add_acc((i,) * 3, i)
-            for i in range(k, k + 3):
-                out += p.add_gyro((i,) * 3)
-        else:
-            for i in range(k, k + 3):
-                out += p.add_gyro((i,) * 3)
-            for i in range(k, k + 3):
-                out += p.add_acc((i,) * 3, i)
-    ok &= check("Giroscopio emparejado con su muestra",
-                len(out) == 30 and all(acc[0] == gyro[0] and paired for acc, gyro, _, paired in out))
-    # Giroscopio detenido: la aceleracion no queda retenida mas de MAX_WAIT muestras.
-    p = ImuPairer()
-    out = []
-    for i in range(20):
-        out += p.add_acc((i,) * 3, i)
-    ok &= check("Sin giroscopio no se retiene la señal", len(out) == 20 - p.max_wait and p.fallbacks == len(out))
-    return ok
-
-
-def _use_temp_data_dir(tmp):
-    storage.DATA_DIR = tmp
-    storage.RESULTS_LOG = os.path.join(tmp, "resultados_ciclovia_v2.csv")
-    storage.TIMED_RESULTS_LOG = os.path.join(tmp, "resultados_pruebas_funcionales.csv")
-    storage.REFERENCE_ORIENTATION_FILE = os.path.join(tmp, "orientacion_referencia.json")
-    storage.REPORTS_DIR = os.path.join(tmp, "reportes")
-
-
-def test_storage_and_config():
-    from core.timed_capture import TimedResult
-    ok = True
-    saved = {k: getattr(storage, k) for k in
-             ("DATA_DIR", "RESULTS_LOG", "TIMED_RESULTS_LOG", "REFERENCE_ORIENTATION_FILE", "REPORTS_DIR")}
-    with tempfile.TemporaryDirectory() as tmp:
-        _use_temp_data_dir(tmp)
-        try:
-            ok &= check("ID de participante válido", storage.normalize_sub("7") == "07"
-                        and storage.normalize_sub("AB12") == "AB12")
-            ok &= check("ID con caracteres de ruta se rechaza",
-                        all(storage.normalize_sub(t) is None for t in ("3/4", "a_b", "..", "c:", "")))
-
-            # CSV bloqueado (Excel): la fila va al pendiente y se incorpora despues.
-            real_write = storage._write_rows
-
-            def locked(path, header, rows):
-                if path == storage.TIMED_RESULTS_LOG:
-                    raise PermissionError(13, "Permission denied")
-                real_write(path, header, rows)
-
-            storage._write_rows = locked
-            warning = storage.append_timed_result("01", "tug", "01", TimedResult(10.5, 900, "manual"))
-            storage._write_rows = real_write
-            pending = storage._pending_path(storage.TIMED_RESULTS_LOG)
-            ok &= check("CSV bloqueado: aviso y fila en pendiente", "Excel" in warning and os.path.exists(pending))
-            ok &= check("Valor anterior se lee del pendiente",
-                        storage.previous_value("01", "tug", timed=True) == 10.5)
-            warning = storage.append_timed_result("01", "tug", "02", TimedResult(9.8, 900, "manual"))
-            with open(storage.TIMED_RESULTS_LOG, encoding="utf-8-sig") as f:
-                lines = f.read().splitlines()
-            ok &= check("Pendiente incorporado al desbloquear",
-                        warning == "" and len(lines) == 3 and not os.path.exists(pending), f"lineas={len(lines)}")
-            with open(storage.TIMED_RESULTS_LOG, "rb") as f:
-                ok &= check("CSV legible en Excel (BOM UTF-8)", f.read(3) == b"\xef\xbb\xbf")
-
-            # Un intento sin muestras deja reporte: el siguiente no lo sobrescribe.
-            storage.save_report("01", "jump", "01", "<p>sin datos</p>")
-            ok &= check("Número de intento no se reutiliza", storage.next_run_number("01", "jump") == "02")
-
-            # Archivos danados no impiden arrancar.
-            with open(storage.REFERENCE_ORIENTATION_FILE, "w") as f:
-                f.write("{no es json")
-            ok &= check("Referencia dañada se ignora", storage.load_reference_orientation("Muñeca") is None)
-            storage.save_reference_orientation("Muñeca", [1, 0, 0, 0])
-            ok &= check("Referencia por ubicación", storage.load_reference_orientation("Muñeca") == [1, 0, 0, 0]
-                        and storage.load_reference_orientation("Cintura") is None)
-            with open(os.path.join(tmp, "configuracion.json"), "w") as f:
-                json.dump(["no", "es", "un", "dict"], f)
-            ok &= check("Configuración dañada usa valores por defecto",
-                        config.load()["mac_address"] == config.DEFAULT_MAC)
-        finally:
-            for k, v in saved.items():
-                setattr(storage, k, v)
-    return ok
-
-
-def test_participant_text():
-    ok = True
-    tug = [Metric("duration_s", "Tiempo", 13.2, "s")]
-    text = participant_summary("tug", "ok", tug, 70)
-    ok &= check("TUG ≥12 s en ≥65 años remite a profesional", "profesional de salud" in text and "No es un diagnóstico" in text)
-    ok &= check("TUG sin edad no aplica umbral", "12 s" not in participant_summary("tug", "ok", tug, None))
-    walk = [Metric("duration_s", "Tiempo", 5.0, "s"), Metric("velocidad_marcha", "Velocidad", 1.0, "m/s")]
-    ok &= check("Marcha 1,0 m/s en ≥65 años sin alarma", "profesional" not in participant_summary("walk", "ok", walk, 70))
-    ok &= check("Intento inválido no muestra valores",
-                "13" not in participant_summary("tug", "fail", tug, 70))
-    return ok
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print("\nTODAS LAS PRUEBAS PASARON" if result.wasSuccessful() else "\nHAY PRUEBAS FALLIDAS")
+    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":

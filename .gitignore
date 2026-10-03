@@ -13,3 +13,7 @@ data/
 respaldo_*/
 /*.csv
 .metawear/
+
+# Pruebas y capturas de verificacion, siempre con datos sinteticos
+artifacts/
+.test_tmp/

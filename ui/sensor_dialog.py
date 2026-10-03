@@ -5,19 +5,28 @@ from PyQt6.QtWidgets import (
 )
 
 from core import config
-from core.sensor_stream import SensorScanner, SimulatedSensorScanner
+from core.connection import ConnectionController
 from ui.theme import BAD, STYLESHEET, TEXT_MUTED
 
 
 class SensorDialog(QDialog):
-    def __init__(self, current_mac: str, simulate: bool, parent=None):
+    def __init__(self, current_mac: str, simulate: bool, parent=None, connection=None):
         super().__init__(parent)
         self.setWindowTitle("Configurar sensor")
         self.setStyleSheet(STYLESHEET)
         self.setMinimumWidth(520)
         self.selected_mac: str | None = None
-        self._scanner_cls = SimulatedSensorScanner if simulate else SensorScanner
-        self._scanner = None
+        self._connection = connection or getattr(parent, "connection", None) or ConnectionController(simulate)
+        self._scan_requested = False
+        self._closed = False
+        self._scan_connections = (
+            (self._connection.scan_started, self._on_scan_started),
+            (self._connection.scan_found, self._on_found),
+            (self._connection.scan_error, self._on_scan_error),
+            (self._connection.scan_finished, self._on_scan_finished),
+        )
+        for signal, slot in self._scan_connections:
+            signal.connect(slot)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -58,19 +67,23 @@ class SensorDialog(QDialog):
         layout.addLayout(buttons)
 
     def _scan(self):
-        parent = self.parent()
-        if parent is not None:
-            parent.stop_sensor()
+        self._scan_requested = True
         self.devices.clear()
         self.scan_btn.setEnabled(False)
-        self.hint.setText("Buscando durante 6 segundos…")
-        self._scanner = self._scanner_cls()
-        self._scanner.found.connect(self._on_found)
-        self._scanner.error.connect(lambda e: self.hint.setText(f"No se pudo buscar: {e}. ¿Está activado el Bluetooth?"))
-        self._scanner.finished.connect(self._on_scan_finished)
-        self._scanner.start()
+        self.hint.setText("Esperando a que el sensor libere el Bluetooth…")
+        self._connection.scan()
+
+    def _on_scan_started(self):
+        if not self._closed:
+            self.hint.setText("Buscando durante 6 segundos…")
+
+    def _on_scan_error(self, message: str):
+        if not self._closed:
+            self.hint.setText(f"No se pudo buscar: {message}. ¿Está activado el Bluetooth?")
 
     def _on_found(self, mac: str, name: str, rssi: int):
+        if self._closed:
+            return
         item = QListWidgetItem(f"{name}   ·   {mac}   ·   señal {rssi} dBm")
         item.setData(Qt.ItemDataRole.UserRole, mac)
         self.devices.addItem(item)
@@ -78,6 +91,9 @@ class SensorDialog(QDialog):
             self.mac_input.setText(mac)
 
     def _on_scan_finished(self):
+        if self._closed:
+            return
+        self._scan_requested = False
         self.scan_btn.setEnabled(True)
         if self.devices.count() == 0 and not self.hint.text().startswith("No se pudo"):
             self.hint.setText("No se encontraron sensores. Compruebe que esté encendido y cargado.")
@@ -93,6 +109,12 @@ class SensorDialog(QDialog):
         self.accept()
 
     def done(self, result):
-        if self._scanner is not None and self._scanner.isRunning():
-            self._scanner.wait(8000)
+        self._closed = True
+        if self._scan_requested:
+            self._connection.cancel_scan()
+        for signal, slot in self._scan_connections:
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
         super().done(result)

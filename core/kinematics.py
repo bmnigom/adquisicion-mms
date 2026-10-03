@@ -17,6 +17,7 @@ Metodos:
 """
 from collections import deque
 from dataclasses import dataclass, field, replace
+import math
 
 import numpy as np
 
@@ -24,7 +25,7 @@ from core.orientation import G
 from core.pipeline import ProcessedSample
 from core.sample_clock import WINDOW_S, reconstruct
 
-ALGORITHM_VERSION = "2.1"
+ALGORITHM_VERSION = "2.2"
 
 # -- Deteccion de reposo / movimiento ----------------------------------------
 REST_WINDOW_SAMPLES = 10       # ventana para la desviacion estandar de |a|
@@ -42,6 +43,10 @@ ARM_REST_S = 0.5               # reposo necesario antes del movimiento (referenc
 # (2) confirmar una perdida de datos requiere ~0,5 s de datos posteriores.
 END_REST_S = {"jump": 0.6, "punch": 0.6, "sts": 0.6}
 PRE_ROLL_S = 0.3               # muestras previas a la deteccion que se incluyen
+STS_PRE_ROLL_S = 1.0
+STS_START_VELOCITY = 0.08       # evidencia de ascenso integrado desde reposo
+STS_END_VELOCITY = 0.08         # tolera deriva provisional antes de la corrección final
+STS_END_ACCELERATION = 0.08     # m/s², promedio corto cercano al reposo final
 MAX_REP_S = 6.0
 MIN_REP_S = 0.15
 ONSET_DEVIATION_G = 0.06
@@ -96,7 +101,9 @@ class RepResult:
 
     @property
     def valid(self) -> bool:
-        return bool(self.metrics) and all(c.status != "fail" for c in self.checks)
+        return (bool(self.metrics) and math.isfinite(self.duration_s) and self.duration_s >= 0
+                and all(math.isfinite(m.value) for m in self.metrics)
+                and all(c.status in {"ok", "warn"} for c in self.checks))
 
     @property
     def primary(self) -> Metric | None:
@@ -117,22 +124,37 @@ class RepDetector:
     """Reposo (>= 0,5 s) -> movimiento -> reposo. Entrega el resultado analizado."""
 
     def __init__(self, task: str, mass_kg: float, sample_rate_hz: float = 100.0):
+        if task not in {"jump", "sts", "punch"}:
+            raise ValueError("Prueba IMU desconocida.")
+        if not all(math.isfinite(v) and v > 0 for v in (mass_kg, sample_rate_hz)):
+            raise ValueError("Masa y frecuencia deben ser positivas y finitas.")
         self.task = task
         self.mass_kg = mass_kg
         self.rate_hz = sample_rate_hz
         self.phase = "wait_rest"
         self._window: deque[float] = deque(maxlen=REST_WINDOW_SAMPLES)
+        self._av_window: deque[float] = deque(maxlen=REST_WINDOW_SAMPLES)
         # Historia suficiente para reconstruir perdidas justo antes del movimiento.
-        self._history: deque[ProcessedSample] = deque(maxlen=int((PRE_ROLL_S + WINDOW_S) * sample_rate_hz) + 1)
+        self._pre_roll_s = STS_PRE_ROLL_S if task == "sts" else PRE_ROLL_S
+        self._history: deque[ProcessedSample] = deque(maxlen=int((self._pre_roll_s + WINDOW_S) * sample_rate_hz) + 1)
         self._context: list[ProcessedSample] = []
         self._rest_time = 0.0
         self._baseline_av = 0.0
         self._rep: list[ProcessedSample] = []
         self._move_start_t = 0.0
         self._deviation_streak = 0
+        self._sts_velocity = 0.0
+        self._sts_prev_av = 0.0
 
     def update(self, s: ProcessedSample) -> tuple[LiveState, RepResult | None]:
+        if not s.signal_valid:
+            if self.phase == "moving":
+                self._rep.append(s)
+            self._history.append(s)
+            self._rest_time = 0.0
+            return LiveState(self.phase, 0.0, 0.0), None
         self._window.append(s.acc_mag)
+        self._av_window.append(s.a_vertical)
         std = float(np.std(self._window)) if len(self._window) >= 4 else 0.0
         at_rest = (
             len(self._window) >= REST_WINDOW_SAMPLES and std < REST_STD_G
@@ -143,13 +165,27 @@ class RepDetector:
             std > MOVING_STD_G or abs(s.acc_mag - 1.0) > MOVING_DEVIATION_G
             or self._deviation_streak >= SUSTAINED_SAMPLES or s.gyro_mag_dps > MOVING_GYRO_DPS
         )
+        if self.task == "sts" and self.phase in {"armed", "moving"}:
+            av = s.a_vertical - self._baseline_av
+            self._sts_velocity += 0.5 * (self._sts_prev_av + av) * s.dt
+            self._sts_prev_av = av
+            # Reiniciar solo evidencia débil en reposo inicial, nunca la velocidad
+            # de un ascenso ya detectado cuando su aceleración pasa por cero.
+            if self.phase == "armed" and at_rest and abs(av) < 0.08 and abs(self._sts_velocity) < 0.03:
+                self._sts_velocity = 0.0
+            moving = moving or self._sts_velocity >= STS_START_VELOCITY
+            if self.phase == "moving":
+                mean_av = float(np.mean(self._av_window)) - self._baseline_av
+                at_rest = (at_rest and abs(self._sts_velocity) < STS_END_VELOCITY
+                           and abs(mean_av) < STS_END_ACCELERATION)
         result = None
 
         if self.phase in ("wait_rest", "armed"):
             if self.phase == "armed" and moving:
                 rest_samples = [h for h in self._history][-int(ARM_REST_S * self.rate_hz):]
-                self._baseline_av = float(np.mean([h.a_vertical for h in rest_samples])) if rest_samples else 0.0
-                pre_roll = int(PRE_ROLL_S * self.rate_hz)
+                if self.task != "sts":
+                    self._baseline_av = float(np.mean([h.a_vertical for h in rest_samples if h.signal_valid])) if rest_samples else 0.0
+                pre_roll = int(self._pre_roll_s * self.rate_hz)
                 self._rep = list(self._history)[-pre_roll:] + [s]
                 self._context = list(self._history)[:-pre_roll]
                 self._move_start_t = s.t
@@ -159,6 +195,12 @@ class RepDetector:
                 self._rest_time = self._rest_time + s.dt if at_rest else 0.0
                 # Una vez armado, pequenos ajustes por debajo del umbral de movimiento no lo desarman.
                 if self._rest_time >= ARM_REST_S:
+                    if self.phase != "armed":
+                        rest = [h.a_vertical for h in list(self._history)[-int(ARM_REST_S * self.rate_hz):]
+                                if h.signal_valid] + [s.a_vertical]
+                        self._baseline_av = float(np.mean(rest))
+                        self._sts_velocity = 0.0
+                        self._sts_prev_av = s.a_vertical - self._baseline_av
                     self.phase = "armed"
         elif self.phase == "moving":
             self._rep.append(s)
@@ -194,14 +236,23 @@ class RepDetector:
     def _reconstruct_times(self) -> list[ProcessedSample]:
         """Tiempos y perdidas definitivos del tramo, usando la historia previa como contexto."""
         span = self._context + self._rep
-        times, lost = reconstruct([s.host_time for s in span], self.rate_hz)
+        native_times = [s.device_time for s in span] if all(s.device_time is not None for s in span) else None
+        sequences = [s.sequence for s in span] if all(s.sequence is not None for s in span) else None
+        times, lost = reconstruct([s.host_time for s in span], self.rate_hz,
+                                  device_times=native_times, sequences=sequences)
         n0 = len(self._context)
         t0 = self._rep[0].t - times[n0]
         return [replace(s, t=float(times[n0 + i] + t0), lost_before=int(lost[n0 + i]))
                 for i, s in enumerate(self._rep)]
 
     def _analyze(self) -> RepResult:
-        rep = self._reconstruct_times()
+        if any(not s.signal_valid for s in self._rep):
+            return RepResult(self.task, 0.0, checks=[Check("Datos numéricos", "fail",
+                             "Hay muestras no finitas o mal formadas durante el movimiento. Repita la captura.")])
+        try:
+            rep = self._reconstruct_times()
+        except ValueError as exc:
+            return RepResult(self.task, 0.0, checks=[Check("Tiempos de medición", "fail", str(exc))])
         t = np.array([s.t for s in rep])
         acc_mag = np.array([s.acc_mag for s in rep])
         deviating = np.nonzero(np.abs(acc_mag - 1.0) > ONSET_DEVIATION_G)[0]
@@ -219,16 +270,36 @@ class RepDetector:
         if self.task == "jump":
             # La continuidad que importa en el salto es la del vuelo (la revisa _analyze_jump).
             checks = []
+        if self.task in {"sts", "punch"}:
+            checks.extend(_gyro_checks(rep))
         return RepResult(self.task, duration, metrics, checks + extra_checks, method, float(t[-1]))
 
 
 def _continuity_check(samples: list[ProcessedSample], where: str) -> Check:
     lost = sum(s.lost_before for s in samples[1:])
     if lost == 0:
-        return Check("Continuidad de datos", "ok", f"Sin muestras perdidas {where}.")
+        native = all(s.device_time is not None or s.sequence is not None for s in samples)
+        detail = f"No se detectaron muestras perdidas {where}."
+        if not native:
+            detail += " Estimación por llegada al PC; puede omitir pérdidas pequeñas y cambios de latencia."
+        return Check("Continuidad de datos", "ok", detail)
     return Check("Continuidad de datos", "fail",
                  f"Se perdieron datos {where} (unas {lost} muestras). El Bluetooth no entregó "
                  "todos los datos; repita acercando el computador al sensor.")
+
+
+def _gyro_checks(samples):
+    checks = []
+    fallback = sum(s.gyro_pairing == "fallback" for s in samples)
+    saturated = sum(s.gyro_saturated for s in samples)
+    uncertain = sum(s.gyro_pairing in {"estimated", "unknown"} for s in samples)
+    if fallback:
+        checks.append(Check("Sincronía IMU", "fail", f"{fallback} muestras usan giros sustituidos sin pareja; la integración no es fiable."))
+    elif uncertain:
+        checks.append(Check("Sincronía IMU", "warn", "El emparejamiento IMU es estimado; no hay identidad temporal nativa verificada."))
+    if saturated:
+        checks.append(Check("Saturación del giroscopio", "fail", f"{saturated} muestras alcanzaron el rango de giro; la orientación no es fiable."))
+    return checks
 
 
 def _saturation_count(samples) -> int:

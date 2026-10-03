@@ -18,7 +18,7 @@ El manual de uso (protocolo de campo, cómo leer el reporte, cambios de la versi
 python -m venv .venv
 .venv\Scripts\pip install -r requirements-dev.txt
 .venv\Scripts\python main.py --simulate      :: interfaz con datos sintéticos, sin sensor
-.venv\Scripts\python -m tests.test_algoritmos :: pruebas de los algoritmos
+.venv\Scripts\python -m unittest discover -s tests -v :: pruebas unitarias y de integración
 ```
 
 Construir el ejecutable y el instalador (requiere [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
@@ -27,6 +27,8 @@ Construir el ejecutable y el instalador (requiere [Inno Setup 6](https://jrsoftw
 packaging\construir.cmd
 ```
 
-Genera `dist\AdquisicionMMS\` (ejecutable) y `dist\instalador\AdquisicionMMS-<versión>-instalador.exe`. Para una nueva versión, actualice el número en `core/__init__.py`, `packaging/instalador.iss` y `packaging/version_info.txt`.
+Genera `dist\AdquisicionMMS\` (ejecutable) y `dist\instalador\AdquisicionMMS-<versión>-instalador.exe`. La versión se mantiene en `core/__init__.py`; `packaging/build.py` sincroniza los recursos del ejecutable e instalador.
+
+La interfaz usa una paleta oscura de alto contraste, gráficas en vivo y navegación por pasos. En **Datos** se puede abrir la carpeta o crear/restaurar respaldos verificados. La simulación mantiene sus datos y calibraciones separados de las mediciones reales. Las sesiones enlazan manifiesto, CSV y reporte mediante un identificador único.
 
 Los datos de participantes (`data/`) no se versionan.

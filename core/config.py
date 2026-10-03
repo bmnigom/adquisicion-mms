@@ -30,8 +30,13 @@ def load() -> dict:
 
 def save(config: dict) -> None:
     os.makedirs(storage.DATA_DIR, exist_ok=True)
-    with open(_path(), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    normalized = dict(config)
+    mac = normalize_mac(normalized.get("mac_address", ""))
+    if mac is None:
+        raise ValueError("La dirección MAC del sensor no es válida.")
+    normalized["mac_address"] = mac
+    with storage._file_lock(_path() + ".lock"):
+        storage.save_json_atomic(_path(), normalized)
 
 
 def normalize_mac(text: str) -> str | None:

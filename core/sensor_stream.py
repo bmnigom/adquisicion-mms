@@ -11,8 +11,9 @@ Cambios de confiabilidad respecto a la version anterior:
     antes el estado seguia en "transmitiendo" aunque el sensor se hubiera caido.
   - Si falla la configuracion despues de conectar, igual se desconecta, para que
     "Reintentar conexion" funcione.
-  - Cada aceleracion se empareja con el giroscopio del mismo instante (ImuPairer),
-    no con el ultimo recibido.
+  - El acelerometro y el giroscopio se emparejan por orden (ImuPairer). Los
+    paquetes actuales no incluyen un reloj nativo: la coincidencia temporal es
+    estimada y se registra su calidad; no se garantiza el mismo instante.
 """
 import os
 import threading
@@ -46,16 +47,17 @@ class SensorStream(QThread):
     def __init__(self, mac_address: str = MAC_ADDRESS, parent=None):
         super().__init__(parent)
         self.mac_address = mac_address
-        self._stop_requested = False
+        self._stop_event = threading.Event()
 
     def request_stop(self):
-        self._stop_requested = True
+        self._stop_event.set()
 
     def set_profile(self, task: str):
         """Solo tiene efecto en el simulador."""
 
     def run(self):
-        self._stop_requested = False
+        if self._stop_event.is_set():
+            return
         try:
             self._run_real_sensor()
         except Exception as exc:  # noqa: BLE001 - queremos capturar cualquier fallo de hardware
@@ -72,8 +74,16 @@ class SensorStream(QThread):
         self.status_changed.emit("conectando")
         # La cache del SDK va con los datos: la carpeta del programa puede ser de solo lectura.
         device = MetaWear(self.mac_address, cache_path=os.path.join(storage.DATA_DIR, ".metawear"))
-        device.connect()
-        if self._stop_requested:
+        try:
+            device.connect()
+        except Exception:
+            # connect() puede haber reservado el adaptador antes de fallar.
+            try:
+                device.disconnect()
+            except Exception:
+                pass
+            raise
+        if self._stop_event.is_set():
             # Se pidio detener mientras connect() estaba bloqueado: liberar el sensor ya.
             try:
                 device.disconnect()
@@ -85,11 +95,12 @@ class SensorStream(QThread):
         self.status_changed.emit("conectado")
 
         board = device.board
-        started = False
+        gyro = None
         signals = []
         try:
             libmetawear.mbl_mw_settings_set_connection_parameters(board, 7.5, 7.5, 0, 6000)
-            time.sleep(1.0)
+            if self._stop_event.wait(1.0):
+                return
 
             gyro_type = libmetawear.mbl_mw_metawearboard_lookup_module(board, Module.GYRO)
             if gyro_type == _GYRO_BMI270:
@@ -133,6 +144,7 @@ class SensorStream(QThread):
             # Las notificaciones de cada senal pueden llegar por hilos distintos del SDK.
             lock = threading.Lock()
             last_arrival = {"t": time.perf_counter()}
+            callback_error = []
 
             def emit(ready):
                 for acc, gyro, (t, host_t, lost), paired in ready:
@@ -140,22 +152,33 @@ class SensorStream(QThread):
                         "time": t, "host_time": host_t, "lost_before": lost,
                         "acc_x": acc[0], "acc_y": acc[1], "acc_z": acc[2],
                         "gyr_x": gyro[0], "gyr_y": gyro[1], "gyr_z": gyro[2],
-                        "gyro_emparejado": int(paired),
+                        "gyro_emparejado": int(bool(paired)),
+                        "gyro_pairing": paired.name.lower(),
                     })
 
             def on_gyro(ctx, data):
-                v = parse_value(data)
-                with lock:
-                    emit(pairer.add_gyro((float(v.x), float(v.y), float(v.z))))
+                if self._stop_event.is_set():
+                    return
+                try:
+                    v = parse_value(data)
+                    with lock:
+                        emit(pairer.add_gyro((float(v.x), float(v.y), float(v.z))))
+                except Exception as exc:
+                    callback_error.append(str(exc))
 
             def on_acc(ctx, data):
-                host_t = time.perf_counter()
-                last_arrival["t"] = host_t
-                v = parse_value(data)
-                with lock:
-                    t, lost = clock.stamp(host_t)
-                    emit(pairer.add_acc((float(v.x), float(v.y), float(v.z)), (t, host_t, lost),
-                                        resync=lost > 0))
+                if self._stop_event.is_set():
+                    return
+                try:
+                    host_t = time.perf_counter()
+                    v = parse_value(data)
+                    with lock:
+                        t, lost = clock.stamp(host_t)
+                        last_arrival["t"] = host_t
+                        emit(pairer.add_acc((float(v.x), float(v.y), float(v.z)), (t, host_t, lost),
+                                            resync=lost > 0))
+                except Exception as exc:
+                    callback_error.append(str(exc))
 
             cb_gyro = FnVoid_VoidP_DataP(on_gyro)
             cb_acc = FnVoid_VoidP_DataP(on_acc)
@@ -166,12 +189,12 @@ class SensorStream(QThread):
             gyro["enable"](board)
             gyro["start"](board)
             libmetawear.mbl_mw_acc_start(board)
-            started = True
             last_arrival["t"] = time.perf_counter()
 
             first_sample_seen = False
-            while not self._stop_requested:
-                self.msleep(50)
+            while not self._stop_event.wait(0.05):
+                if callback_error:
+                    raise RuntimeError(f"No se pudo interpretar una muestra del sensor: {callback_error[0]}")
                 if disconnected["flag"]:
                     raise RuntimeError("El sensor se desconectó (Bluetooth). Acérquelo al computador y reintente")
                 silent = time.perf_counter() - last_arrival["t"]
@@ -183,10 +206,12 @@ class SensorStream(QThread):
         finally:
             if not disconnected["flag"]:
                 for step in (
-                    lambda: libmetawear.mbl_mw_acc_stop(board) if started else None,
-                    lambda: gyro["stop"](board) if started else None,
-                    lambda: libmetawear.mbl_mw_acc_disable_acceleration_sampling(board) if started else None,
-                    lambda: gyro["disable"](board) if started else None,
+                    # Liberar tambien configuraciones que fallaron a mitad de
+                    # arrancar: un unico flag final omitia la limpieza parcial.
+                    lambda: libmetawear.mbl_mw_acc_stop(board),
+                    lambda: gyro["stop"](board) if gyro is not None else None,
+                    lambda: libmetawear.mbl_mw_acc_disable_acceleration_sampling(board),
+                    lambda: gyro["disable"](board) if gyro is not None else None,
                     *[lambda s=s: libmetawear.mbl_mw_datasignal_unsubscribe(s) for s in signals],
                 ):
                     try:
@@ -206,23 +231,43 @@ class SensorScanner(QThread):
     found = pyqtSignal(str, str, int)  # mac, nombre, rssi (dBm)
     error = pyqtSignal(str)
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_event = threading.Event()
+
+    def request_stop(self):
+        self._stop_event.set()
+
     def run(self):
+        if self._stop_event.is_set():
+            return
         try:
             from mbientlab.metawear import MetaWear
             from mbientlab.warble import BleScanner
 
             seen = set()
+            callback_error = []
 
             def handler(result):
-                is_metawear = result.has_service_uuid(MetaWear.GATT_SERVICE) or "metawear" in result.name.lower()
-                if is_metawear and result.mac not in seen:
-                    seen.add(result.mac)
-                    self.found.emit(result.mac.upper(), result.name or "MetaWear", int(result.rssi))
+                if self._stop_event.is_set():
+                    return
+                try:
+                    name = result.name or ""
+                    mac = result.mac.upper()
+                    is_metawear = result.has_service_uuid(MetaWear.GATT_SERVICE) or "metawear" in name.lower()
+                    if is_metawear and mac not in seen:
+                        seen.add(mac)
+                        self.found.emit(mac, name or "MetaWear", int(result.rssi))
+                except Exception as exc:
+                    callback_error.append(str(exc))
+                    self._stop_event.set()
 
             BleScanner.set_handler(handler)
             BleScanner.start()
             try:
-                self.msleep(int(SCAN_DURATION_S * 1000))
+                self._stop_event.wait(SCAN_DURATION_S)
+                if callback_error:
+                    raise RuntimeError(callback_error[0])
             finally:
                 BleScanner.stop()
         except Exception as exc:  # noqa: BLE001 - Bluetooth apagado o sin adaptador
@@ -233,9 +278,16 @@ class SimulatedSensorScanner(QThread):
     found = pyqtSignal(str, str, int)
     error = pyqtSignal(str)
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_event = threading.Event()
+
+    def request_stop(self):
+        self._stop_event.set()
+
     def run(self):
-        self.msleep(800)
-        self.found.emit("E7:D7:CE:C3:E0:25", "MetaWear (simulado)", -55)
+        if not self._stop_event.wait(0.8):
+            self.found.emit("E7:D7:CE:C3:E0:25", "MetaWear (simulado)", -55)
 
 
 class SimulatedSensorStream(QThread):
@@ -257,11 +309,11 @@ class SimulatedSensorStream(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._stop_requested = False
+        self._stop_event = threading.Event()
         self._profile = "jump"
 
     def request_stop(self):
-        self._stop_requested = True
+        self._stop_event.set()
 
     def set_profile(self, task: str):
         if task in self.PROFILES:
@@ -274,20 +326,23 @@ class SimulatedSensorStream(QThread):
         ))
 
     def run(self):
-        self._stop_requested = False
+        if self._stop_event.is_set():
+            return
         self.status_changed.emit("conectando")
-        self.msleep(400)
+        if self._stop_event.wait(0.4):
+            return
         self.status_changed.emit("conectado")
-        self.msleep(200)
+        if self._stop_event.wait(0.2):
+            return
 
         clock = SampleClock(SAMPLE_RATE_HZ)
         t0 = time.perf_counter()
         emitted = 0
         movement = self._next_movement()
         announced = False
-        while not self._stop_requested:
+        while not self._stop_event.is_set():
             due = int((time.perf_counter() - t0) * SAMPLE_RATE_HZ)
-            while emitted < due:
+            while emitted < due and not self._stop_event.is_set():
                 try:
                     ax, ay, az, gx, gy, gz = next(movement)
                 except StopIteration:
@@ -299,11 +354,12 @@ class SimulatedSensorStream(QThread):
                     "time": t, "host_time": host_t, "lost_before": lost,
                     "acc_x": ax, "acc_y": ay, "acc_z": az,
                     "gyr_x": gx, "gyr_y": gy, "gyr_z": gz, "gyro_emparejado": 1,
+                    "gyro_pairing": "native",
                 })
                 emitted += 1
             if not announced and emitted:
                 announced = True
                 self.status_changed.emit("transmitiendo")
-            self.msleep(30)
+            self._stop_event.wait(0.03)
 
         self.status_changed.emit("desconectado")
